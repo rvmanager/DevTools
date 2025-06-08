@@ -5,18 +5,108 @@
 #include <fstream>
 #include <algorithm>
 #include <set>
+#include <map>
 #include <sstream>
+#include <cctype>
+#include <regex>
 #include <unistd.h> // for getopt
 
 namespace fs = std::filesystem;
 
+struct PatternFilter {
+    std::string pattern;
+    bool is_include; // true for -e, false for -v
+};
+
+struct CommentStyle {
+    std::string single_line;
+    std::string multi_start;
+    std::string multi_end;
+    bool has_comments;
+};
+
 class TreePrinter {
 private:
-    std::set<std::string> exclude_list;
+    std::vector<PatternFilter> pattern_filters;
     bool show_dir_only = false;
     
-    bool is_excluded(const std::string& name) const {
-        return exclude_list.find(name) != exclude_list.end();
+    // Comment styles lookup table
+    std::map<std::string, CommentStyle> comment_styles = {
+        {".cpp", {"//", "/*", "*/", true}},
+        {".c", {"//", "/*", "*/", true}},
+        {".h", {"//", "/*", "*/", true}},
+        {".hpp", {"//", "/*", "*/", true}},
+        {".swift", {"//", "/*", "*/", true}},
+        {".sh", {"#", "", "", true}},
+        {".bash", {"#", "", "", true}},
+        {".py", {"#", "'''", "'''", true}},
+        {".js", {"//", "/*", "*/", true}},
+        {".ts", {"//", "/*", "*/", true}},
+        {".java", {"//", "/*", "*/", true}},
+        {".cs", {"//", "/*", "*/", true}},
+        {".go", {"//", "/*", "*/", true}},
+        {".php", {"//", "/*", "*/", true}},
+        {".rb", {"#", "=begin", "=end", true}},
+        {".rs", {"//", "/*", "*/", true}},
+        {".lua", {"--", "--[[", "]]", true}},
+        {".html", {"", "<!--", "-->", true}},
+        {".xml", {"", "<!--", "-->", true}},
+        {".yaml", {"#", "", "", true}},
+        {".yml", {"#", "", "", true}},
+        {".json", {"", "", "", false}},
+        {".ini", {"#", "", "", true}},
+        {".sql", {"--", "/*", "*/", true}},
+        {".tex", {"%", "", "", true}},
+        {".md", {"", "", "", false}},
+        {".cmake", {"#", "", "", true}},
+        {".txt", {"", "", "", false}}
+    };
+    
+    bool matches_patterns(const std::string& name) const {
+        if (pattern_filters.empty()) {
+            return true; // No filters means include everything
+        }
+        
+        bool result = true; // Start with include by default
+        
+        // Apply filters in order
+        for (const auto& filter : pattern_filters) {
+            try {
+                std::regex pattern_regex(filter.pattern);
+                bool matches = std::regex_search(name, pattern_regex);
+                
+                if (filter.is_include) {
+                    // -e: include if matches
+                    result = matches;
+                } else {
+                    // -v: exclude if matches (include if doesn't match)
+                    result = !matches;
+                }
+                
+                // If current filter excludes this item, we're done
+                if (!result) {
+                    break;
+                }
+            } catch (const std::regex_error& e) {
+                std::cerr << "Invalid regex pattern '" << filter.pattern << "': " << e.what() << std::endl;
+                return false;
+            }
+        }
+        
+        return result;
+    }
+    
+    CommentStyle get_comment_style(const fs::path& file_path) const {
+        std::string extension = file_path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+        
+        auto it = comment_styles.find(extension);
+        if (it != comment_styles.end()) {
+            return it->second;
+        }
+        
+        // Default: no comments
+        return {"", "", "", false};
     }
     
     bool is_binary(const fs::path& file_path) const {
@@ -30,7 +120,11 @@ private:
         file.read(buffer, sizeof(buffer));
         std::streamsize bytes_read = file.gcount();
         
-        // Check for null bytes (common indicator of binary files)
+        if (bytes_read == 0) {
+            return false; // Empty file is considered text
+        }
+        
+        // Check for null bytes (definitive indicator of binary files)
         for (std::streamsize i = 0; i < bytes_read; ++i) {
             if (buffer[i] == '\0') {
                 return true;
@@ -41,13 +135,18 @@ private:
         int non_printable = 0;
         for (std::streamsize i = 0; i < bytes_read; ++i) {
             unsigned char c = static_cast<unsigned char>(buffer[i]);
+            // Allow common whitespace characters
             if (c < 32 && c != '\t' && c != '\n' && c != '\r') {
+                non_printable++;
+            }
+            // Check for extended ASCII that might indicate binary
+            if (c > 126) {
                 non_printable++;
             }
         }
         
         // If more than 30% non-printable, consider it binary
-        return (bytes_read > 0) && (non_printable * 100 / bytes_read > 30);
+        return (non_printable * 100 / bytes_read > 30);
     }
     
     void print_tree(const fs::path& dir, const std::string& prefix) const {
@@ -62,7 +161,7 @@ private:
             for (const auto& entry : fs::directory_iterator(dir)) {
                 // Skip hidden files (starting with .)
                 std::string filename = entry.path().filename().string();
-                if (filename[0] != '.' && !is_excluded(filename)) {
+                if (filename[0] != '.' && matches_patterns(filename)) {
                     entries.push_back(entry);
                 }
             }
@@ -100,8 +199,8 @@ private:
             for (const auto& entry : fs::recursive_directory_iterator(dir)) {
                 if (entry.is_regular_file()) {
                     std::string filename = entry.path().filename().string();
-                    // Skip hidden files and excluded files
-                    if (filename[0] != '.' && !is_excluded(filename)) {
+                    // Skip hidden files and check pattern filters
+                    if (filename[0] != '.' && matches_patterns(filename)) {
                         files.push_back(entry.path());
                     }
                 }
@@ -111,30 +210,52 @@ private:
             return;
         }
         
+        if (files.empty()) {
+            std::cout << std::endl << "No matching directories or files!" << std::endl;
+            return;
+        }
+        
         // Sort files
         std::sort(files.begin(), files.end());
         
         // Print file contents
         for (const auto& file_path : files) {
-            if (!is_binary(file_path)) {
-                fs::path relative_path = fs::relative(file_path, dir);
-                
-                std::cout << std::endl;
+            if (is_binary(file_path)) {
+                // Skip binary files, don't show content
+                continue;
+            }
+            
+            fs::path relative_path = fs::relative(file_path, dir);
+            CommentStyle style = get_comment_style(file_path);
+            
+            std::cout << std::endl;
+            
+            if (style.has_comments && !style.single_line.empty()) {
+                // Use single-line comments
+                std::cout << style.single_line << " ========================================================" << std::endl;
+                std::cout << style.single_line << "  File: " << root_name << "/" << relative_path.string() << std::endl;
+                std::cout << style.single_line << "  <content> ----------------------------------------------" << std::endl;
+            } else {
+                // Fallback to original format for files without comments
                 std::cout << "===================================" << std::endl;
                 std::cout << "File: " << root_name << "/" << relative_path.string() << std::endl;
                 std::cout << "<content> -------------------------" << std::endl;
-                
-                std::ifstream file(file_path);
-                if (file.is_open()) {
-                    std::cout << file.rdbuf();
-                    file.close();
-                } else {
-                    std::cout << "Error: Could not open file" << std::endl;
-                }
-                
-                std::cout << "</content> ------------------------" << std::endl;
-                std::cout << std::endl;
             }
+            
+            std::ifstream file(file_path);
+            if (file.is_open()) {
+                std::cout << file.rdbuf();
+                file.close();
+            } else {
+                std::cout << "Error: Could not open file" << std::endl;
+            }
+            
+            if (style.has_comments && !style.single_line.empty()) {
+                std::cout << style.single_line << "  </content> ----------------------------------------------" << std::endl;
+            } else {
+                std::cout << "</content> ------------------------" << std::endl;
+            }
+            std::cout << std::endl;
         }
     }
     
@@ -152,10 +273,19 @@ private:
         fs::path parent_dir = file_path.parent_path();
         std::string root_name = parent_dir.filename().string();
         std::string file_name = file_path.filename().string();
+        CommentStyle style = get_comment_style(file_path);
         
-        std::cout << "===================================" << std::endl;
-        std::cout << "File: " << root_name << "/" << file_name << std::endl;
-        std::cout << "<content> -------------------------" << std::endl;
+        if (style.has_comments && !style.single_line.empty()) {
+            // Use single-line comments
+            std::cout << style.single_line << " ========================================================" << std::endl;
+            std::cout << style.single_line << "  File: " << root_name << "/" << file_name << std::endl;
+            std::cout << style.single_line << "  <content> ----------------------------------------------" << std::endl;
+        } else {
+            // Fallback to original format
+            std::cout << "===================================" << std::endl;
+            std::cout << "File: " << root_name << "/" << file_name << std::endl;
+            std::cout << "<content> -------------------------" << std::endl;
+        }
         
         std::ifstream file(file_path);
         if (file.is_open()) {
@@ -165,24 +295,16 @@ private:
             std::cout << "Error: Could not open file" << std::endl;
         }
         
-        std::cout << "</content> ------------------------" << std::endl;
+        if (style.has_comments && !style.single_line.empty()) {
+            std::cout << style.single_line << "  </content> ----------------------------------------------" << std::endl;
+        } else {
+            std::cout << "</content> ------------------------" << std::endl;
+        }
     }
     
 public:
-    void set_exclude_list(const std::string& exclude_str) {
-        if (exclude_str.empty()) return;
-        
-        std::stringstream ss(exclude_str);
-        std::string item;
-        
-        while (std::getline(ss, item, ',')) {
-            // Trim whitespace
-            item.erase(0, item.find_first_not_of(" \t"));
-            item.erase(item.find_last_not_of(" \t") + 1);
-            if (!item.empty()) {
-                exclude_list.insert(item);
-            }
-        }
+    void add_pattern_filter(const std::string& pattern, bool is_include) {
+        pattern_filters.push_back({pattern, is_include});
     }
     
     void set_show_dir_only(bool value) {
@@ -195,11 +317,29 @@ public:
             fs::path current_dir = fs::current_path();
             std::string root_name = current_dir.filename().string();
             
+            // Check if any files/directories match after filtering
+            bool has_matches = false;
+            try {
+                for (const auto& entry : fs::recursive_directory_iterator(current_dir)) {
+                    std::string filename = entry.path().filename().string();
+                    if (filename[0] != '.' && matches_patterns(filename)) {
+                        has_matches = true;
+                        break;
+                    }
+                }
+            } catch (const fs::filesystem_error& e) {
+                // Continue with normal processing
+            }
+            
             std::cout << root_name << std::endl;
             print_tree(current_dir, "");
             
             if (!show_dir_only) {
-                print_file_content(current_dir, root_name);
+                if (!has_matches) {
+                    std::cout << std::endl << "No matching directories or files!" << std::endl;
+                } else {
+                    print_file_content(current_dir, root_name);
+                }
             }
         } else {
             fs::path target_path(target);
@@ -207,14 +347,37 @@ public:
             if (fs::is_directory(target_path)) {
                 std::string root_name = fs::absolute(target_path).filename().string();
                 
+                // Check if any files/directories match after filtering
+                bool has_matches = false;
+                try {
+                    for (const auto& entry : fs::recursive_directory_iterator(target_path)) {
+                        std::string filename = entry.path().filename().string();
+                        if (filename[0] != '.' && matches_patterns(filename)) {
+                            has_matches = true;
+                            break;
+                        }
+                    }
+                } catch (const fs::filesystem_error& e) {
+                    // Continue with normal processing
+                }
+                
                 std::cout << root_name << std::endl;
                 print_tree(target_path, "");
                 
                 if (!show_dir_only) {
-                    print_file_content(target_path, root_name);
+                    if (!has_matches) {
+                        std::cout << std::endl << "No matching directories or files!" << std::endl;
+                    } else {
+                        print_file_content(target_path, root_name);
+                    }
                 }
             } else if (fs::is_regular_file(target_path)) {
-                print_single_file(target_path);
+                std::string filename = target_path.filename().string();
+                if (matches_patterns(filename)) {
+                    print_single_file(target_path);
+                } else {
+                    std::cout << "No matching directories or files!" << std::endl;
+                }
             } else {
                 std::cout << "Error: Target does not exist or is not accessible." << std::endl;
             }
@@ -222,11 +385,18 @@ public:
     }
     
     static void print_usage(const char* program_name) {
-        std::cout << "Usage: " << program_name << " [-d] [-x exclude_list] [filename|directory]" << std::endl;
+        std::cout << "Usage: " << program_name << " [-d] [-e pattern] [-v pattern] [filename|directory]" << std::endl;
         std::cout << "  -d : only show the directory structure" << std::endl;
-        std::cout << "  -x exclude_list : comma-separated list of files and directories to exclude" << std::endl;
+        std::cout << "  -e pattern : only include files/directories matching pattern (regex)" << std::endl;
+        std::cout << "  -v pattern : exclude files/directories matching pattern (regex)" << std::endl;
+        std::cout << "  Multiple -e and -v options can be used and are applied in order" << std::endl;
         std::cout << "  filename or directory : show output from given directory, or if a file, only the file content" << std::endl;
         std::cout << "  If no arguments are provided, it will show both structure and content for the current directory" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Examples:" << std::endl;
+        std::cout << "  " << program_name << " -v build -e \"\\\\.cpp$\"     # Exclude 'build' dirs, include only .cpp files" << std::endl;
+        std::cout << "  " << program_name << " -e \"src|include\"          # Include only items matching 'src' or 'include'" << std::endl;
+        std::cout << "  " << program_name << " -v \"\\\\.o$\" -v \"\\\\.so$\"     # Exclude .o and .so files" << std::endl;
     }
 };
 
@@ -235,13 +405,16 @@ int main(int argc, char* argv[]) {
     std::string target;
     
     int opt;
-    while ((opt = getopt(argc, argv, "dx:")) != -1) {
+    while ((opt = getopt(argc, argv, "de:v:")) != -1) {
         switch (opt) {
             case 'd':
                 printer.set_show_dir_only(true);
                 break;
-            case 'x':
-                printer.set_exclude_list(optarg);
+            case 'e':
+                printer.add_pattern_filter(optarg, true);  // include pattern
+                break;
+            case 'v':
+                printer.add_pattern_filter(optarg, false); // exclude pattern
                 break;
             default:
                 TreePrinter::print_usage(argv[0]);
