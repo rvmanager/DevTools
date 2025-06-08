@@ -1,0 +1,125 @@
+#-----------------------------------------------------
+# OS-specific files
+#-----------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+*.swp
+*~
+ehthumbs.db
+Thumbs.db
+
+#-----------------------------------------------------
+# Build artifacts
+#-----------------------------------------------------
+*.o
+*.obj
+*.lo
+*.la
+*.al
+*.libs
+*.so
+*.so.*
+*.a
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# Make & CMake
+Makefile
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# Autotools
+/aclocal.m4
+/autom4te.cache/
+/compile
+/config.guess
+/config.log
+/config.status
+/config.sub
+/configure
+/depcomp
+/install-sh
+/ltmain.sh
+/missing
+/stamp-h1
+
+#-----------------------------------------------------
+# CLion / JetBrains IDEs
+#-----------------------------------------------------
+.idea/
+cmake-build-*/
+
+#-----------------------------------------------------
+# Xcode
+#-----------------------------------------------------
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcworkspace/
+DerivedData/
+*.xcuserstate
+
+#-----------------------------------------------------
+# Visual Studio Code
+#-----------------------------------------------------
+.vscode/
+.history/
+
+#-----------------------------------------------------
+# Package manager / dependency artifacts
+#-----------------------------------------------------
+conanbuildinfo.*
+*.lock
+*.pyc
+__pycache__/
+build/
+bin/
+lib/
+*.log
+
+#-----------------------------------------------------
+# Test and coverage files
+#-----------------------------------------------------
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+#-----------------------------------------------------
+# Archives and backups
+#-----------------------------------------------------
+*.tar
+*.tgz
+*.tar.gz
+*.zip
+*.7z
+*.bak
+*.tmp
+*.orig
+
+#-----------------------------------------------------
+# Custom project output
+#-----------------------------------------------------
+output/
+dist/
+logs/
+
