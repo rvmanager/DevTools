@@ -29,6 +29,7 @@ class TreePrinter {
 private:
     std::vector<PatternFilter> pattern_filters;
     bool show_dir_only = false;
+    mutable std::set<std::string> unknown_extensions; // Track unknown extensions
     
     // Comment styles lookup table
     std::map<std::string, CommentStyle> comment_styles = {
@@ -59,7 +60,8 @@ private:
         {".tex", {"%", "", "", true}},
         {".md", {"", "", "", false}},
         {".cmake", {"#", "", "", true}},
-        {".txt", {"", "", "", false}}
+        {".txt", {"", "", "", false}},
+        {".proto", {"//", "/*", "*/", true}}
     };
     
     bool matches_patterns(const std::string& name) const {
@@ -103,6 +105,11 @@ private:
         auto it = comment_styles.find(extension);
         if (it != comment_styles.end()) {
             return it->second;
+        }
+        
+        // Track unknown extensions (only if they have an extension)
+        if (!extension.empty() && extension != ".") {
+            unknown_extensions.insert(extension);
         }
         
         // Default: no comments
@@ -149,7 +156,7 @@ private:
         return (non_printable * 100 / bytes_read > 30);
     }
     
-    void print_tree(const fs::path& dir, const std::string& prefix) const {
+    void print_tree(const fs::path& dir, const std::string& prefix, std::vector<fs::path>& visible_files) const {
         if (!fs::exists(dir) || !fs::is_directory(dir)) {
             return;
         }
@@ -176,56 +183,37 @@ private:
                       return a.path().filename() < b.path().filename();
                   });
         
-        // Print entries
+        // Print entries and collect visible files
         for (const auto& entry : entries) {
             std::string filename = entry.path().filename().string();
             std::cout << prefix << "|_ " << filename << std::endl;
             
             if (entry.is_directory()) {
-                print_tree(entry.path(), prefix + "|     ");
+                print_tree(entry.path(), prefix + "|     ", visible_files);
+            } else if (entry.is_regular_file()) {
+                visible_files.push_back(entry.path());
             }
         }
     }
     
-    void print_file_content(const fs::path& dir, const std::string& root_name) const {
-        if (!fs::exists(dir)) {
-            return;
-        }
-        
-        std::vector<fs::path> files;
-        
-        // Collect all files recursively
-        try {
-            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-                if (entry.is_regular_file()) {
-                    std::string filename = entry.path().filename().string();
-                    // Skip hidden files and check pattern filters
-                    if (filename[0] != '.' && matches_patterns(filename)) {
-                        files.push_back(entry.path());
-                    }
-                }
-            }
-        } catch (const fs::filesystem_error& e) {
-            std::cerr << "Error reading directory " << dir << ": " << e.what() << std::endl;
-            return;
-        }
-        
-        if (files.empty()) {
+    void print_file_content(const std::vector<fs::path>& visible_files, const std::string& root_name, const fs::path& base_dir) const {
+        if (visible_files.empty()) {
             std::cout << std::endl << "No matching directories or files!" << std::endl;
             return;
         }
         
         // Sort files
-        std::sort(files.begin(), files.end());
+        std::vector<fs::path> sorted_files = visible_files;
+        std::sort(sorted_files.begin(), sorted_files.end());
         
         // Print file contents
-        for (const auto& file_path : files) {
+        for (const auto& file_path : sorted_files) {
             if (is_binary(file_path)) {
                 // Skip binary files, don't show content
                 continue;
             }
             
-            fs::path relative_path = fs::relative(file_path, dir);
+            fs::path relative_path = fs::relative(file_path, base_dir);
             CommentStyle style = get_comment_style(file_path);
             
             std::cout << std::endl;
@@ -302,6 +290,17 @@ private:
         }
     }
     
+    void print_unknown_extensions_warning() const {
+        if (!unknown_extensions.empty()) {
+            std::cerr << std::endl << "Warning: Unknown file extensions encountered (no comment style defined):" << std::endl;
+            for (const auto& ext : unknown_extensions) {
+                std::cerr << "  " << ext << std::endl;
+            }
+            std::cerr << "These files will use the default format without comment-style headers." << std::endl;
+            std::cerr << std::endl;
+        }
+    }
+    
 public:
     void add_pattern_filter(const std::string& pattern, bool is_include) {
         pattern_filters.push_back({pattern, is_include});
@@ -317,64 +316,40 @@ public:
             fs::path current_dir = fs::current_path();
             std::string root_name = current_dir.filename().string();
             
-            // Check if any files/directories match after filtering
-            bool has_matches = false;
-            try {
-                for (const auto& entry : fs::recursive_directory_iterator(current_dir)) {
-                    std::string filename = entry.path().filename().string();
-                    if (filename[0] != '.' && matches_patterns(filename)) {
-                        has_matches = true;
-                        break;
-                    }
-                }
-            } catch (const fs::filesystem_error& e) {
-                // Continue with normal processing
-            }
-            
             std::cout << root_name << std::endl;
-            print_tree(current_dir, "");
+            
+            std::vector<fs::path> visible_files;
+            print_tree(current_dir, "", visible_files);
             
             if (!show_dir_only) {
-                if (!has_matches) {
-                    std::cout << std::endl << "No matching directories or files!" << std::endl;
-                } else {
-                    print_file_content(current_dir, root_name);
-                }
+                print_file_content(visible_files, root_name, current_dir);
             }
+            
+            // Print warning about unknown extensions at the end
+            print_unknown_extensions_warning();
         } else {
             fs::path target_path(target);
             
             if (fs::is_directory(target_path)) {
                 std::string root_name = fs::absolute(target_path).filename().string();
                 
-                // Check if any files/directories match after filtering
-                bool has_matches = false;
-                try {
-                    for (const auto& entry : fs::recursive_directory_iterator(target_path)) {
-                        std::string filename = entry.path().filename().string();
-                        if (filename[0] != '.' && matches_patterns(filename)) {
-                            has_matches = true;
-                            break;
-                        }
-                    }
-                } catch (const fs::filesystem_error& e) {
-                    // Continue with normal processing
-                }
-                
                 std::cout << root_name << std::endl;
-                print_tree(target_path, "");
+                
+                std::vector<fs::path> visible_files;
+                print_tree(target_path, "", visible_files);
                 
                 if (!show_dir_only) {
-                    if (!has_matches) {
-                        std::cout << std::endl << "No matching directories or files!" << std::endl;
-                    } else {
-                        print_file_content(target_path, root_name);
-                    }
+                    print_file_content(visible_files, root_name, target_path);
                 }
+                
+                // Print warning about unknown extensions at the end
+                print_unknown_extensions_warning();
             } else if (fs::is_regular_file(target_path)) {
                 std::string filename = target_path.filename().string();
                 if (matches_patterns(filename)) {
                     print_single_file(target_path);
+                    // Print warning about unknown extensions at the end
+                    print_unknown_extensions_warning();
                 } else {
                     std::cout << "No matching directories or files!" << std::endl;
                 }
