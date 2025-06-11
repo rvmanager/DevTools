@@ -67,7 +67,8 @@ private:
         {".txt", {"", "", "", false}},
         {".proto", {"//", "/*", "*/", true}},
         {".ex", {"#", "", "", true}},
-        {".exs", {"#", "", "", true}}
+        {".exs", {"#", "", "", true}},
+        {".pl", {"#", "", "", true}}
     };
     
     bool matches_patterns(const fs::path& full_path) const {
@@ -448,8 +449,17 @@ public:
         } else {
             fs::path target_path(target);
             
-            if (fs::is_directory(target_path)) {
-                base_directory = fs::absolute(target_path);
+            // Make the target path absolute first to avoid issues with relative paths
+            fs::path absolute_target_path;
+            try {
+                absolute_target_path = fs::absolute(target_path);
+            } catch (const fs::filesystem_error& e) {
+                std::cout << "Error: Cannot resolve path '" << target << "': " << e.what() << std::endl;
+                return;
+            }
+            
+            if (fs::is_directory(absolute_target_path)) {
+                base_directory = absolute_target_path;
                 std::string root_name = base_directory.filename().string();
                 
                 std::cout << root_name << std::endl;
@@ -463,10 +473,18 @@ public:
                 
                 // Print warning about unknown extensions at the end
                 print_unknown_extensions_warning();
-            } else if (fs::is_regular_file(target_path)) {
-                base_directory = fs::absolute(target_path.parent_path());
-                if (matches_patterns(fs::absolute(target_path))) {
-                    print_single_file(target_path);
+            } else if (fs::is_regular_file(absolute_target_path)) {
+                // For files, get the parent directory safely
+                fs::path parent_path = absolute_target_path.parent_path();
+                if (parent_path.empty()) {
+                    // If parent is empty, use current directory
+                    base_directory = fs::current_path();
+                } else {
+                    base_directory = parent_path;
+                }
+                
+                if (matches_patterns(absolute_target_path)) {
+                    print_single_file(absolute_target_path);
                     // Print warning about unknown extensions at the end
                     print_unknown_extensions_warning();
                 } else {
@@ -477,7 +495,7 @@ public:
             }
         }
     }
-    
+
     static void print_usage(const char* program_name) {
         std::cout << "Usage: " << program_name << " [-d] [-n] [-e pattern] [-v pattern] [filename|directory]" << std::endl;
         std::cout << "  -d : only show the directory structure" << std::endl;
