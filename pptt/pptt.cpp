@@ -1,3 +1,4 @@
+//  File: pptt/pptt.cpp
 #include <iostream>
 #include <string>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <cctype>
 #include <regex>
 #include <unistd.h> // for getopt
+#include <iomanip>
 
 namespace fs = std::filesystem;
 
@@ -29,7 +31,9 @@ class TreePrinter {
 private:
     std::vector<PatternFilter> pattern_filters;
     bool show_dir_only = false;
+    bool show_line_numbers = false;
     mutable std::set<std::string> unknown_extensions; // Track unknown extensions
+    fs::path base_directory; // Store base directory for relative path calculations
     
     // Comment styles lookup table
     std::map<std::string, CommentStyle> comment_styles = {
@@ -61,33 +65,50 @@ private:
         {".md", {"", "", "", false}},
         {".cmake", {"#", "", "", true}},
         {".txt", {"", "", "", false}},
-        {".proto", {"//", "/*", "*/", true}}
+        {".proto", {"//", "/*", "*/", true}},
+        {".ex", {"#", "", "", true}},
+        {".exs", {"#", "", "", true}}
     };
     
-    bool matches_patterns(const std::string& name) const {
+    bool matches_patterns(const fs::path& full_path) const {
         if (pattern_filters.empty()) {
             return true; // No filters means include everything
         }
+    
+        // Get relative path from base directory
+        fs::path relative_path;
+        try {
+            relative_path = fs::relative(full_path, base_directory);
+        } catch (const fs::filesystem_error&) {
+            // If we can't get relative path, use the full path
+            relative_path = full_path;
+        }
         
-        bool result = true; // Start with include by default
+        // Convert to string with forward slashes (consistent across platforms)
+        std::string path_str = relative_path.string();
+        std::replace(path_str.begin(), path_str.end(), '\\', '/');
         
-        // Apply filters in order
+        bool has_include_filters = false;
+        bool has_exclude_filters = false;
+        bool matches_include = false;
+        bool matches_exclude = false;
+        
+        // First, determine what types of filters we have and check matches
         for (const auto& filter : pattern_filters) {
             try {
                 std::regex pattern_regex(filter.pattern);
-                bool matches = std::regex_search(name, pattern_regex);
+                bool matches = std::regex_search(path_str, pattern_regex);
                 
                 if (filter.is_include) {
-                    // -e: include if matches
-                    result = matches;
+                    has_include_filters = true;
+                    if (matches) {
+                        matches_include = true;
+                    }
                 } else {
-                    // -v: exclude if matches (include if doesn't match)
-                    result = !matches;
-                }
-                
-                // If current filter excludes this item, we're done
-                if (!result) {
-                    break;
+                    has_exclude_filters = true;
+                    if (matches) {
+                        matches_exclude = true;
+                    }
                 }
             } catch (const std::regex_error& e) {
                 std::cerr << "Invalid regex pattern '" << filter.pattern << "': " << e.what() << std::endl;
@@ -95,9 +116,21 @@ private:
             }
         }
         
-        return result;
-    }
-    
+        // Apply the logic:
+        // 1. If there are exclude filters and item matches any, exclude it
+        if (has_exclude_filters && matches_exclude) {
+            return false;
+        }
+        
+        // 2. If there are include filters, item must match at least one
+        if (has_include_filters) {
+            return matches_include;
+        }
+        
+        // 3. If only exclude filters (and we got here), include it
+        return true;
+    } 
+
     CommentStyle get_comment_style(const fs::path& file_path) const {
         std::string extension = file_path.extension().string();
         std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
@@ -168,7 +201,7 @@ private:
             for (const auto& entry : fs::directory_iterator(dir)) {
                 // Skip hidden files (starting with .)
                 std::string filename = entry.path().filename().string();
-                if (filename[0] != '.' && matches_patterns(filename)) {
+                if (filename[0] != '.') {
                     entries.push_back(entry);
                 }
             }
@@ -179,20 +212,78 @@ private:
         
         // Sort entries
         std::sort(entries.begin(), entries.end(), 
-                  [](const fs::directory_entry& a, const fs::directory_entry& b) {
-                      return a.path().filename() < b.path().filename();
-                  });
+                [](const fs::directory_entry& a, const fs::directory_entry& b) {
+                    return a.path().filename() < b.path().filename();
+                });
         
         // Print entries and collect visible files
         for (const auto& entry : entries) {
             std::string filename = entry.path().filename().string();
-            std::cout << prefix << "|_ " << filename << std::endl;
             
             if (entry.is_directory()) {
-                print_tree(entry.path(), prefix + "|     ", visible_files);
+                // Check if directory matches patterns
+                if (matches_patterns(entry.path())) {
+                    std::cout << prefix << "|_ " << filename << std::endl;
+                    print_tree(entry.path(), prefix + "|     ", visible_files);
+                } else {
+                    // Directory doesn't match patterns, but explore if it might contain matching items
+                    if (directory_contains_matches(entry.path())) {
+                        print_tree(entry.path(), prefix, visible_files);
+                    }
+                }
             } else if (entry.is_regular_file()) {
-                visible_files.push_back(entry.path());
+                // Check if file matches patterns
+                if (matches_patterns(entry.path())) {
+                    std::cout << prefix << "|_ " << filename << std::endl;
+                    visible_files.push_back(entry.path());
+                }
             }
+        }
+    }
+    
+    int count_digits(int number) const {
+        if (number == 0) return 1;
+        int digits = 0;
+        while (number > 0) {
+            number /= 10;
+            digits++;
+        }
+        return digits;
+    }
+    
+    void print_file_content_with_lines(const fs::path& file_path) const {
+        std::ifstream file(file_path);
+        if (!file.is_open()) {
+            std::cout << "Error: Could not open file" << std::endl;
+            return;
+        }
+        
+        if (!show_line_numbers) {
+            std::cout << file.rdbuf();
+            return;
+        }
+        
+        // First pass: count total lines to determine width
+        std::string line;
+        int total_lines = 0;
+        std::streampos start_pos = file.tellg();
+        
+        while (std::getline(file, line)) {
+            total_lines++;
+        }
+        
+        // Reset file position
+        file.clear();
+        file.seekg(start_pos);
+        
+        // Determine width for line numbers
+        int width = count_digits(total_lines);
+        
+        // Second pass: print with line numbers
+        int line_number = 1;
+        while (std::getline(file, line)) {
+            std::cout << std::setw(width) << line_number << ": " << line << std::endl;
+            line_number++;
         }
     }
     
@@ -230,13 +321,7 @@ private:
                 std::cout << "<content> -------------------------" << std::endl;
             }
             
-            std::ifstream file(file_path);
-            if (file.is_open()) {
-                std::cout << file.rdbuf();
-                file.close();
-            } else {
-                std::cout << "Error: Could not open file" << std::endl;
-            }
+            print_file_content_with_lines(file_path);
             
             if (style.has_comments && !style.single_line.empty()) {
                 std::cout << style.single_line << "  </content> ----------------------------------------------" << std::endl;
@@ -245,6 +330,41 @@ private:
             }
             std::cout << std::endl;
         }
+    }
+
+    // Helper method to check if a directory contains any matching files/subdirectories
+    bool directory_contains_matches(const fs::path& dir) const {
+        if (!fs::exists(dir) || !fs::is_directory(dir)) {
+            return false;
+        }
+        
+        try {
+            for (const auto& entry : fs::directory_iterator(dir)) {
+                std::string filename = entry.path().filename().string();
+                
+                // Skip hidden files
+                if (filename[0] == '.') {
+                    continue;
+                }
+                
+                // Check if this item matches the patterns
+                if (matches_patterns(entry.path())) {
+                    return true;
+                }
+                
+                // If it's a directory, recursively check its contents
+                if (entry.is_directory()) {
+                    if (directory_contains_matches(entry.path())) {
+                        return true;
+                    }
+                }
+            }
+        } catch (const fs::filesystem_error& e) {
+            // If we can't read the directory, assume it might contain matches
+            return true;
+        }
+        
+        return false;
     }
     
     void print_single_file(const fs::path& file_path) const {
@@ -275,13 +395,7 @@ private:
             std::cout << "<content> -------------------------" << std::endl;
         }
         
-        std::ifstream file(file_path);
-        if (file.is_open()) {
-            std::cout << file.rdbuf();
-            file.close();
-        } else {
-            std::cout << "Error: Could not open file" << std::endl;
-        }
+        print_file_content_with_lines(file_path);
         
         if (style.has_comments && !style.single_line.empty()) {
             std::cout << style.single_line << "  </content> ----------------------------------------------" << std::endl;
@@ -310,19 +424,23 @@ public:
         show_dir_only = value;
     }
     
+    void set_show_line_numbers(bool value) {
+        show_line_numbers = value;
+    }
+    
     void process_target(const std::string& target) {
         if (target.empty()) {
             // Current directory
-            fs::path current_dir = fs::current_path();
-            std::string root_name = current_dir.filename().string();
+            base_directory = fs::current_path();
+            std::string root_name = base_directory.filename().string();
             
             std::cout << root_name << std::endl;
             
             std::vector<fs::path> visible_files;
-            print_tree(current_dir, "", visible_files);
+            print_tree(base_directory, "", visible_files);
             
             if (!show_dir_only) {
-                print_file_content(visible_files, root_name, current_dir);
+                print_file_content(visible_files, root_name, base_directory);
             }
             
             // Print warning about unknown extensions at the end
@@ -331,22 +449,23 @@ public:
             fs::path target_path(target);
             
             if (fs::is_directory(target_path)) {
-                std::string root_name = fs::absolute(target_path).filename().string();
+                base_directory = fs::absolute(target_path);
+                std::string root_name = base_directory.filename().string();
                 
                 std::cout << root_name << std::endl;
                 
                 std::vector<fs::path> visible_files;
-                print_tree(target_path, "", visible_files);
+                print_tree(base_directory, "", visible_files);
                 
                 if (!show_dir_only) {
-                    print_file_content(visible_files, root_name, target_path);
+                    print_file_content(visible_files, root_name, base_directory);
                 }
                 
                 // Print warning about unknown extensions at the end
                 print_unknown_extensions_warning();
             } else if (fs::is_regular_file(target_path)) {
-                std::string filename = target_path.filename().string();
-                if (matches_patterns(filename)) {
+                base_directory = fs::absolute(target_path.parent_path());
+                if (matches_patterns(fs::absolute(target_path))) {
                     print_single_file(target_path);
                     // Print warning about unknown extensions at the end
                     print_unknown_extensions_warning();
@@ -360,18 +479,22 @@ public:
     }
     
     static void print_usage(const char* program_name) {
-        std::cout << "Usage: " << program_name << " [-d] [-e pattern] [-v pattern] [filename|directory]" << std::endl;
+        std::cout << "Usage: " << program_name << " [-d] [-n] [-e pattern] [-v pattern] [filename|directory]" << std::endl;
         std::cout << "  -d : only show the directory structure" << std::endl;
+        std::cout << "  -n : show line numbers in file content" << std::endl;
         std::cout << "  -e pattern : only include files/directories matching pattern (regex)" << std::endl;
         std::cout << "  -v pattern : exclude files/directories matching pattern (regex)" << std::endl;
         std::cout << "  Multiple -e and -v options can be used and are applied in order" << std::endl;
+        std::cout << "  Patterns match against the full relative path from the base directory" << std::endl;
         std::cout << "  filename or directory : show output from given directory, or if a file, only the file content" << std::endl;
         std::cout << "  If no arguments are provided, it will show both structure and content for the current directory" << std::endl;
         std::cout << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << program_name << " -v build -e \"\\\\.cpp$\"     # Exclude 'build' dirs, include only .cpp files" << std::endl;
-        std::cout << "  " << program_name << " -e \"src|include\"          # Include only items matching 'src' or 'include'" << std::endl;
-        std::cout << "  " << program_name << " -v \"\\\\.o$\" -v \"\\\\.so$\"     # Exclude .o and .so files" << std::endl;
+        std::cout << "  " << program_name << " -v grpc -e \"\\.ex$\"       # Exclude paths containing 'grpc', include only .ex files" << std::endl;
+        std::cout << "  " << program_name << " -e \"src|include\"          # Include only paths matching 'src' or 'include'" << std::endl;
+        std::cout << "  " << program_name << " -v \"\\.o$\" -v \"\\.so$\"     # Exclude .o and .so files" << std::endl;
+        std::cout << "  " << program_name << " -n myfile.cpp             # Show myfile.cpp with line numbers" << std::endl;
+        std::cout << "  " << program_name << " -e \"knowbr_elixir_web/grpc/services\"  # Include only paths under grpc/services" << std::endl;
     }
 };
 
@@ -380,10 +503,13 @@ int main(int argc, char* argv[]) {
     std::string target;
     
     int opt;
-    while ((opt = getopt(argc, argv, "de:v:")) != -1) {
+    while ((opt = getopt(argc, argv, "dne:v:")) != -1) {
         switch (opt) {
             case 'd':
                 printer.set_show_dir_only(true);
+                break;
+            case 'n':
+                printer.set_show_line_numbers(true);
                 break;
             case 'e':
                 printer.add_pattern_filter(optarg, true);  // include pattern
