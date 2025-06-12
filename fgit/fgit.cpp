@@ -97,7 +97,7 @@ private:
         std::cout << "Fetching git diff (staged files)..." << std::endl;
         
         try {
-            std::string diff_output = execute_command("git diff --staged");
+            std::string diff_output = execute_command("git diff --staged --unified=8 --function-context --no-color --stat");
             
             if (diff_output.empty()) {
                 std::cout << "No staged changes detected. Nothing to commit." << std::endl;
