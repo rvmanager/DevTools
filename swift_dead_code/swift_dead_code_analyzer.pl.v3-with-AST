@@ -1,0 +1,874 @@
+#!/usr/bin/env perl
+# swift_dead_code_analyzer.pl
+
+use strict;
+use warnings;
+use File::Find;
+use File::Spec;
+use JSON;
+use Data::Dumper;
+use Getopt::Long;
+
+# Configuration
+my %config = (
+    swift_frontend => '/usr/bin/xcrun swift-frontend',
+    project_path => '.',
+    output_format => 'json',
+    include_tests => 1,
+    verbose => 0,
+    fallback_to_source => 1,
+    sdk_path => undef
+);
+
+# Data structures
+my %functions = ();      # function_id => { name, file, line, type, visibility }
+my %call_graph = ();     # caller_id => [callee_id, ...]
+my %reverse_calls = ();  # callee_id => [caller_id, ...]
+my @entry_points = ();   # [function_id, ...]
+
+sub extract_ast_from_file {
+    my ($swift_file) = @_;
+    
+    if ($config{verbose}) {
+        print "Parsing: $swift_file\n";
+    }
+    
+    # Use the working swift-frontend command with SDK
+    my $cmd = "xcrun swift-frontend -frontend -dump-ast -sdk \$(xcrun --show-sdk-path) -primary-file \"$swift_file\" 2>&1";
+    
+    if ($config{verbose} > 1) {
+        print "  Running: $cmd\n";
+    }
+    
+    open(my $ast_fh, '-|', $cmd) or die "Cannot run swift-frontend: $!";
+    my $ast_content = do { local $/; <$ast_fh> };
+    close($ast_fh);
+    
+    if ($config{verbose} > 1) {
+        print "  AST output length: " . length($ast_content) . " chars\n";
+        if ($ast_content && $ast_content =~ /error:/) {
+            my @lines = split /\n/, $ast_content;
+            my $error_count = grep { /error:/ } @lines;
+            print "  Found $error_count compilation errors (but AST may still be generated)\n";
+        }
+    }
+    
+    # Check if we got valid AST output (even with compilation errors)
+    if ($ast_content && $ast_content =~ /\(source_file/) {
+        if ($config{verbose} > 1) {
+            print "  Successfully extracted AST\n";
+        }
+        return $ast_content;
+    }
+    
+    # If no AST was generated, fall back to source parsing
+    if ($config{verbose}) {
+        print "  No AST generated, falling back to source parsing\n";
+        if ($ast_content) {
+            my $first_line = (split /\n/, $ast_content)[0];
+            print "  Error: $first_line\n";
+        }
+    }
+    
+    return parse_source_directly($swift_file);
+}
+
+sub parse_source_directly {
+    my ($swift_file) = @_;
+    
+    open(my $fh, '<', $swift_file) or die "Cannot open $swift_file: $!";
+    my $content = do { local $/; <$fh> };
+    close($fh);
+    
+    return $content;
+}
+
+sub parse_functions_from_ast {
+    my ($content, $file_path) = @_;
+    
+    # Determine if this is AST output or source code
+    my $is_ast = ($content =~ /\(source_file/);
+    
+    if ($is_ast) {
+        return parse_functions_from_real_ast($content, $file_path);
+    } else {
+        return parse_functions_from_source($content, $file_path);
+    }
+}
+
+sub parse_functions_from_real_ast {
+    my ($ast_content, $file_path) = @_;
+    my @found_functions = ();
+    
+    if ($config{verbose} > 1) {
+        print "  Parsing AST for $file_path\n";
+        print "  AST sample (first 500 chars): " . substr($ast_content, 0, 500) . "\n";
+    }
+    
+    # Debug: Show what function declarations we can find
+    if ($config{verbose} > 1) {
+        my @func_matches = $ast_content =~ /\(func_decl[^)]*?"([^"]+)"/g;
+        print "  Found func_decl patterns: " . join(", ", @func_matches) . "\n" if @func_matches;
+        
+        my @constructor_matches = $ast_content =~ /\(constructor_decl/g;
+        print "  Found " . scalar(@constructor_matches) . " constructor_decl patterns\n";
+        
+        my @struct_matches = $ast_content =~ /\(struct_decl[^)]*?"([^"]+)"/g;
+        print "  Found struct_decl patterns: " . join(", ", @struct_matches) . "\n" if @struct_matches;
+    }
+    
+    # Parse function declarations from AST - simplified pattern first
+    while ($ast_content =~ /\(func_decl[^)]*?"([^"]+)"/g) {
+        my $func_name = $1;
+        
+        # Skip internal compiler functions
+        next if $func_name =~ /^\$|^<anonymous>/;
+        
+        my $line_num = 1;
+        my $function_id = generate_function_id($func_name, $file_path, $line_num);
+        
+        $functions{$function_id} = {
+            name => $func_name,
+            file => $file_path,
+            line => $line_num,
+            type => 'function',
+            visibility => 'internal'  # default for now
+        };
+        
+        push @found_functions, $function_id;
+        
+        if ($config{verbose} > 1) {
+            print "    Found function: $func_name at line $line_num\n";
+        }
+        
+        # Check if this is an entry point
+        if (is_entry_point($func_name, 'internal', $file_path)) {
+            push @entry_points, $function_id;
+            if ($config{verbose} > 1) {
+                print "      -> Entry point: $func_name\n";
+            }
+        }
+    }
+    
+    # Parse constructor declarations - simplified
+    while ($ast_content =~ /\(constructor_decl/g) {
+        my $line_num = 1;
+        my $function_id = generate_function_id('init', $file_path, $line_num);
+        
+        $functions{$function_id} = {
+            name => 'init',
+            file => $file_path,
+            line => $line_num,
+            type => 'initializer',
+            visibility => 'internal'
+        };
+        
+        push @found_functions, $function_id;
+        
+        if ($config{verbose} > 1) {
+            print "    Found initializer: init at line $line_num\n";
+        }
+    }
+    
+    # Parse struct/class declarations and find their methods
+    while ($ast_content =~ /\(struct_decl[^)]*?"([^"]+)"/g) {
+        my $struct_name = $1;
+        
+        if ($config{verbose} > 1) {
+            print "    Found struct: $struct_name\n";
+        }
+        
+        # Look for methods in this struct - simplified approach
+        my $struct_start = pos($ast_content);
+        my $remaining_ast = substr($ast_content, $struct_start);
+        
+        # Find methods within this struct (very basic approach)
+        while ($remaining_ast =~ /\(func_decl[^)]*?"([^"]+)"/g) {
+            my $method_name = $1;
+            last if $remaining_ast =~ /\(struct_decl/; # Stop at next struct
+            
+            next if $method_name =~ /^\$|^<anonymous>/;
+            
+            my $full_name = "$struct_name.$method_name";
+            my $function_id = generate_function_id($full_name, $file_path, 1);
+            
+            $functions{$function_id} = {
+                name => $full_name,
+                file => $file_path,
+                line => 1,
+                type => 'method',
+                visibility => 'internal',
+                parent_class => $struct_name
+            };
+            
+            push @found_functions, $function_id;
+            
+            if ($config{verbose} > 1) {
+                print "      Found method: $full_name\n";
+            }
+            
+            # Check if this is an entry point
+            if (is_entry_point($method_name, 'internal', $file_path, $struct_name)) {
+                push @entry_points, $function_id;
+                if ($config{verbose} > 1) {
+                    print "        -> Entry point: $full_name\n";
+                }
+            }
+        }
+    }
+    
+    if ($config{verbose} > 1) {
+        print "  Found " . scalar(@found_functions) . " functions in AST\n";
+    }
+    
+    return @found_functions;
+}
+
+sub parse_functions_from_source {
+    my ($source_content, $file_path) = @_;
+    my @found_functions = ();
+    my @lines = split /\n/, $source_content;
+    
+    if ($config{verbose} > 1) {
+        print "  Parsing functions from source in $file_path (" . scalar(@lines) . " lines)\n";
+    }
+    
+    for my $line_num (0..$#lines) {
+        my $line = $lines[$line_num];
+        
+        # Skip comments and empty lines
+        next if $line =~ /^\s*\/\// || $line =~ /^\s*$/;
+        
+        # Parse function declarations - very flexible pattern
+        if ($line =~ /(public|internal|private|fileprivate)?\s*(static|class)?\s*(override)?\s*func\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[\(<]/) {
+            my ($visibility, $static, $override, $func_name) = ($1 || 'internal', $2, $3, $4);
+            
+            my $function_id = generate_function_id($func_name, $file_path, $line_num + 1);
+            
+            $functions{$function_id} = {
+                name => $func_name,
+                file => $file_path,
+                line => $line_num + 1,
+                type => 'function',
+                visibility => $visibility,
+                is_static => defined($static),
+                is_override => defined($override)
+            };
+            
+            push @found_functions, $function_id;
+            
+            if ($config{verbose} > 1) {
+                print "    Found function: $func_name at line " . ($line_num + 1) . "\n";
+            }
+            
+            # Check if this is an entry point
+            if (is_entry_point($func_name, $visibility, $file_path)) {
+                push @entry_points, $function_id;
+                if ($config{verbose} > 1) {
+                    print "      -> Entry point: $func_name\n";
+                }
+            }
+        }
+        
+        # Parse class/struct/enum declarations
+        elsif ($line =~ /(public|internal|private|fileprivate)?\s*(final)?\s*(class|struct|enum|actor)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b/) {
+            my ($class_visibility, $final, $type, $class_name) = ($1 || 'internal', $2, $3, $4);
+            
+            if ($config{verbose} > 1) {
+                print "    Found $type: $class_name at line " . ($line_num + 1) . "\n";
+            }
+            
+            # Look for methods and properties in this class
+            my $brace_count = 0;
+            my $in_class = 0;
+            my $found_opening_brace = 0;
+            
+            for my $i ($line_num..$#lines) {
+                my $class_line = $lines[$i];
+                
+                # Count braces to find class boundaries
+                my $open_braces = ($class_line =~ tr/{/{/);
+                my $close_braces = ($class_line =~ tr/}/}/);
+                $brace_count += $open_braces - $close_braces;
+                
+                if ($open_braces > 0 && !$found_opening_brace) {
+                    $in_class = 1;
+                    $found_opening_brace = 1;
+                }
+                
+                next unless $in_class;
+                
+                # Look for methods within the class
+                if ($class_line =~ /\s*(public|internal|private|fileprivate)?\s*(static|class)?\s*(override)?\s*func\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[\(<]/) {
+                    my ($method_visibility, $static_or_class, $override, $method_name) = ($1 || 'internal', $2, $3, $4);
+                    my $full_name = "$class_name.$method_name";
+                    
+                    my $function_id = generate_function_id($full_name, $file_path, $i + 1);
+                    
+                    $functions{$function_id} = {
+                        name => $full_name,
+                        file => $file_path,
+                        line => $i + 1,
+                        type => 'method',
+                        visibility => $method_visibility,
+                        parent_class => $class_name,
+                        is_static => defined($static_or_class),
+                        is_override => defined($override)
+                    };
+                    
+                    push @found_functions, $function_id;
+                    
+                    if ($config{verbose} > 1) {
+                        print "      Found method: $full_name at line " . ($i + 1) . "\n";
+                    }
+                    
+                    # Check if this is an entry point
+                    if (is_entry_point($method_name, $method_visibility, $file_path, $class_name)) {
+                        push @entry_points, $function_id;
+                        if ($config{verbose} > 1) {
+                            print "        -> Entry point: $full_name\n";
+                        }
+                    }
+                }
+                
+                # Look for initializers
+                elsif ($class_line =~ /\s*(public|internal|private|fileprivate)?\s*(convenience)?\s*init\s*[\(<]/) {
+                    my ($init_visibility, $convenience) = ($1 || 'internal', $2);
+                    my $init_name = defined($convenience) ? "init(convenience)" : "init";
+                    my $full_name = "$class_name.$init_name";
+                    
+                    my $function_id = generate_function_id($full_name, $file_path, $i + 1);
+                    
+                    $functions{$function_id} = {
+                        name => $full_name,
+                        file => $file_path,
+                        line => $i + 1,
+                        type => 'initializer',
+                        visibility => $init_visibility,
+                        parent_class => $class_name,
+                        is_convenience => defined($convenience)
+                    };
+                    
+                    push @found_functions, $function_id;
+                    
+                    if ($config{verbose} > 1) {
+                        print "      Found initializer: $full_name at line " . ($i + 1) . "\n";
+                    }
+                }
+                
+                # Look for computed properties
+                elsif ($class_line =~ /\s*(public|internal|private|fileprivate)?\s*(static|class)?\s*var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:.*\{/) {
+                    my ($prop_visibility, $static_or_class, $prop_name) = ($1 || 'internal', $2, $3);
+                    
+                    # Check if this is a SwiftUI body property
+                    if ($prop_name eq 'body' && $class_line =~ /some\s+View/) {
+                        my $full_name = "$class_name.$prop_name";
+                        my $function_id = generate_function_id($full_name, $file_path, $i + 1);
+                        
+                        $functions{$function_id} = {
+                            name => $full_name,
+                            file => $file_path,
+                            line => $i + 1,
+                            type => 'swiftui_body',
+                            visibility => $prop_visibility,
+                            parent_class => $class_name
+                        };
+                        
+                        push @found_functions, $function_id;
+                        push @entry_points, $function_id;  # SwiftUI body is always an entry point
+                        
+                        if ($config{verbose} > 1) {
+                            print "      Found SwiftUI body: $full_name at line " . ($i + 1) . "\n";
+                            print "        -> Entry point: $full_name\n";
+                        }
+                    }
+                }
+                
+                # Exit when we've closed all braces for this class
+                last if $found_opening_brace && $brace_count <= 0;
+            }
+        }
+        
+        # Parse standalone initializers (outside of classes)
+        elsif ($line =~ /\s*(public|internal|private|fileprivate)?\s*(convenience)?\s*init\s*[\(<]/) {
+            my ($visibility, $convenience) = ($1 || 'internal', $2);
+            my $init_name = defined($convenience) ? "init(convenience)" : "init";
+            my $function_id = generate_function_id($init_name, $file_path, $line_num + 1);
+            
+            $functions{$function_id} = {
+                name => $init_name,
+                file => $file_path,
+                line => $line_num + 1,
+                type => 'initializer',
+                visibility => $visibility,
+                is_convenience => defined($convenience)
+            };
+            
+            push @found_functions, $function_id;
+            
+            if ($config{verbose} > 1) {
+                print "    Found standalone initializer: $init_name at line " . ($line_num + 1) . "\n";
+            }
+        }
+        
+        # Parse standalone SwiftUI body properties
+        elsif ($line =~ /\s*(public|internal|private|fileprivate)?\s*var\s+body\s*:\s*some\s+View\s*\{/) {
+            my $visibility = $1 || 'internal';
+            my $function_id = generate_function_id('body', $file_path, $line_num + 1);
+            
+            $functions{$function_id} = {
+                name => 'body',
+                file => $file_path,
+                line => $line_num + 1,
+                type => 'swiftui_body',
+                visibility => $visibility
+            };
+            
+            push @found_functions, $function_id;
+            push @entry_points, $function_id;  # SwiftUI body is always an entry point
+            
+            if ($config{verbose} > 1) {
+                print "    Found standalone SwiftUI body at line " . ($line_num + 1) . "\n";
+                print "      -> Entry point: body\n";
+            }
+        }
+    }
+    
+    if ($config{verbose} > 1) {
+        print "  Found " . scalar(@found_functions) . " functions in $file_path\n";
+    }
+    
+    return @found_functions;
+}
+
+sub parse_function_calls_from_ast {
+    my ($content, $file_path, $functions_in_file) = @_;
+    
+    # Determine if this is AST output or source code
+    my $is_ast = ($content =~ /\(source_file/);
+    
+    if ($is_ast) {
+        parse_calls_from_real_ast($content, $file_path);
+    } else {
+        parse_calls_from_source($content, $file_path);
+    }
+}
+
+sub parse_calls_from_real_ast {
+    my ($ast_content, $file_path) = @_;
+    
+    if ($config{verbose} > 1) {
+        print "  Parsing function calls from AST for $file_path\n";
+    }
+    
+    # Pattern for function calls in AST: (call_expr type='...' (declref_expr "functionName")
+    my $call_count = 0;
+    while ($ast_content =~ /\(call_expr[^)]*?\(declref_expr\s+"([^"]+)"/gs) {
+        my $called_function = $1;
+        $call_count++;
+        
+        # Find the calling function context by looking backwards in the AST
+        my $calling_function = find_calling_function_context($ast_content, pos($ast_content));
+        
+        if ($calling_function) {
+            my $caller_id = find_function_id_by_name($calling_function, $file_path);
+            my $callee_id = find_function_id_by_name($called_function);
+            
+            if ($caller_id && $callee_id) {
+                push @{$call_graph{$caller_id}}, $callee_id;
+                if ($config{verbose} > 2) {
+                    print "    Call: $calling_function -> $called_function\n";
+                }
+            }
+        }
+    }
+    
+    # Pattern for method calls: (call_expr (dot_syntax_call_expr (declref_expr) (declref_expr "methodName")
+    while ($ast_content =~ /\(call_expr[^)]*?\(dot_syntax_call_expr[^)]*?\(declref_expr[^)]*?\)\s*\(declref_expr\s+"([^"]+)"/gs) {
+        my $called_method = $1;
+        $call_count++;
+        
+        my $calling_function = find_calling_function_context($ast_content, pos($ast_content));
+        
+        if ($calling_function) {
+            my $caller_id = find_function_id_by_name($calling_function, $file_path);
+            
+            # Try to find the method in our function list (could be Class.method)
+            for my $func_id (keys %functions) {
+                if ($functions{$func_id}->{name} =~ /\.\Q$called_method\E$/) {
+                    push @{$call_graph{$caller_id}}, $func_id;
+                    if ($config{verbose} > 2) {
+                        print "    Method call: $calling_function -> $functions{$func_id}->{name}\n";
+                    }
+                    last;
+                }
+            }
+        }
+    }
+    
+    if ($config{verbose} > 1) {
+        print "  Found $call_count function calls in AST\n";
+    }
+}
+
+sub parse_calls_from_source {
+    my ($source_content, $file_path) = @_;
+    my @lines = split /\n/, $source_content;
+    my $current_function = '';
+    
+    for my $line_num (0..$#lines) {
+        my $line = $lines[$line_num];
+        
+        # Track which function we're currently in
+        if ($line =~ /\s*(?:public|internal|private|fileprivate)?\s*func\s+([^\s(]+)\s*\(/) {
+            $current_function = $1;
+        }
+        elsif ($line =~ /\s*(?:class|struct|enum)\s+([^\s{:]+)/) {
+            my $class_name = $1;
+            # Look ahead for methods in this class
+            my $brace_count = 0;
+            my $in_class = 0;
+            
+            for my $i ($line_num..$#lines) {
+                my $class_line = $lines[$i];
+                
+                $brace_count += ($class_line =~ tr/{/{/);
+                $brace_count -= ($class_line =~ tr/}/}/);
+                
+                if ($class_line =~ /{/) {
+                    $in_class = 1;
+                }
+                
+                if ($in_class && $class_line =~ /\s*(?:public|internal|private|fileprivate)?\s*func\s+([^\s(]+)\s*\(/) {
+                    $current_function = "$class_name.$1";
+                    last;
+                }
+                
+                last if $in_class && $brace_count == 0;
+            }
+        }
+        
+        # Look for function calls in the current line
+        # Simple pattern matching for function calls
+        while ($line =~ /\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g) {
+            my $called_function = $1;
+            
+            # Skip common Swift keywords and operators
+            next if $called_function =~ /^(if|for|while|switch|guard|let|var|func|class|struct|enum|return|print|import)$/;
+            
+            if ($current_function) {
+                my $caller_id = find_function_id_by_name($current_function, $file_path);
+                my $callee_id = find_function_id_by_name($called_function);
+                
+                if ($caller_id && $callee_id) {
+                    push @{$call_graph{$caller_id}}, $callee_id;
+                    # Don't add to reverse_calls here, we'll build it later
+                }
+            }
+        }
+        
+        # Look for method calls (object.method())
+        while ($line =~ /\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g) {
+            my $called_method = $1;
+            
+            if ($current_function) {
+                my $caller_id = find_function_id_by_name($current_function, $file_path);
+                
+                # Try to find the method in our function list
+                for my $func_id (keys %functions) {
+                    if ($functions{$func_id}->{name} =~ /\.$called_method$/) {
+                        push @{$call_graph{$caller_id}}, $func_id;
+                        last;
+                    }
+                }
+            }
+        }
+    }
+}
+
+sub generate_function_id {
+    my ($name, $file, $line) = @_;
+    $line //= 0;
+    return "$file:$line:$name";
+}
+
+sub is_entry_point {
+    my ($func_name, $type_info, $file_path, $class_name) = @_;
+    
+    # Main function
+    return 1 if $func_name eq 'main';
+    
+    # @main attributed types
+    return 1 if $type_info =~ /\@main/;
+    
+    # Test functions
+    return 1 if $func_name =~ /^test/ && $file_path =~ /test/i;
+    
+    # UIApplicationMain or similar
+    return 1 if $func_name =~ /^(applicationDidFinishLaunching|application.*)/;
+    
+    # SwiftUI App protocol conformance
+    return 1 if $func_name eq 'body' && $class_name && $class_name =~ /App$/;
+    
+    # View body properties (SwiftUI)
+    return 1 if $func_name eq 'body' && $file_path =~ /View\.swift$/i;
+    
+    # Public functions in framework context
+    return 1 if $type_info =~ /public/ || $type_info eq 'public';
+    
+    # @objc methods (could be called from Objective-C)
+    return 1 if $type_info =~ /\@objc/;
+    
+    # @IBAction methods (connected to Interface Builder)
+    return 1 if $type_info =~ /\@IBAction/;
+    
+    # @IBOutlet properties (connected to Interface Builder)
+    return 1 if $type_info =~ /\@IBOutlet/;
+    
+    # Common lifecycle methods
+    return 1 if $func_name =~ /^(viewDidLoad|viewWillAppear|viewDidAppear|viewWillDisappear|viewDidDisappear|loadView)$/;
+    
+    # Delegate methods
+    return 1 if $func_name =~ /^(delegate|dataSource)/i;
+    
+    return 0;
+}
+
+sub build_reverse_call_graph {
+    %reverse_calls = ();
+    
+    for my $caller_id (keys %call_graph) {
+        for my $callee_id (@{$call_graph{$caller_id}}) {
+            push @{$reverse_calls{$callee_id}}, $caller_id;
+        }
+    }
+}
+
+sub find_reachable_functions {
+    my @reachable = ();
+    my %visited = ();
+    my @queue = @entry_points;
+    
+    while (@queue) {
+        my $current = shift @queue;
+        next if $visited{$current};
+        
+        $visited{$current} = 1;
+        push @reachable, $current;
+        
+        # Add all functions called by this function
+        if ($call_graph{$current}) {
+            for my $callee (@{$call_graph{$current}}) {
+                push @queue, $callee unless $visited{$callee};
+            }
+        }
+    }
+    
+    return @reachable;
+}
+
+sub find_dead_code {
+    my @reachable = find_reachable_functions();
+    my %reachable_set = map { $_ => 1 } @reachable;
+    
+    my @dead_functions = ();
+    for my $func_id (keys %functions) {
+        unless ($reachable_set{$func_id}) {
+            push @dead_functions, $func_id;
+        }
+    }
+    
+    return @dead_functions;
+}
+
+sub analyze_project {
+    my ($project_path) = @_;
+    
+    print "Analyzing Swift project at: $project_path\n" if $config{verbose};
+    
+    # Find all Swift files
+    my @swift_files = ();
+    find(sub {
+        push @swift_files, $File::Find::name if /\.swift$/;
+    }, $project_path);
+    
+    print "Found " . scalar(@swift_files) . " Swift files\n" if $config{verbose};
+    
+    my $success_count = 0;
+    my $total_files = scalar(@swift_files);
+    
+    # Phase 1: Extract all functions
+    for my $file (@swift_files) {
+        eval {
+            my $content = extract_ast_from_file($file);
+            if ($content) {
+                my @file_functions = parse_functions_from_ast($content, $file);
+                
+                # Phase 2: Extract function calls
+                parse_function_calls_from_ast($content, $file, \@file_functions);
+                $success_count++;
+            }
+        };
+        
+        if ($@) {
+            print "Warning: Failed to parse $file: $@\n" if $config{verbose};
+        }
+    }
+    
+    print "Successfully parsed $success_count of $total_files files\n" if $config{verbose};
+    print "Total functions found: " . scalar(keys %functions) . "\n" if $config{verbose};
+    print "Entry points found: " . scalar(@entry_points) . "\n" if $config{verbose};
+    
+    if ($config{verbose} > 1) {
+        print "Entry points:\n";
+        for my $entry (@entry_points) {
+            print "  - $functions{$entry}->{name} ($entry)\n";
+        }
+    }
+    
+    # Phase 3: Build reverse call graph
+    build_reverse_call_graph();
+    print "Call graph edges: " . scalar(keys %call_graph) . "\n" if $config{verbose};
+    
+    # Phase 4: Find dead code
+    my @dead_functions = find_dead_code();
+    
+    return @dead_functions;
+}
+
+sub generate_report {
+    my (@dead_functions) = @_;
+    
+    if ($config{output_format} eq 'json') {
+        my @report_data = ();
+        for my $func_id (@dead_functions) {
+            my $func_info = $functions{$func_id};
+            push @report_data, {
+                function => $func_info->{name},
+                file => $func_info->{file},
+                line => $func_info->{line},
+                type => $func_info->{type},
+                visibility => $func_info->{visibility}
+            };
+        }
+        
+        print encode_json({
+            summary => {
+                total_functions => scalar(keys %functions),
+                dead_functions => scalar(@dead_functions),
+                entry_points => scalar(@entry_points)
+            },
+            dead_code => \@report_data
+        });
+    } else {
+        print "=== Swift Dead Code Analysis Report ===\n\n";
+        print "Total functions analyzed: " . scalar(keys %functions) . "\n";
+        print "Entry points found: " . scalar(@entry_points) . "\n";
+        print "Dead functions found: " . scalar(@dead_functions) . "\n\n";
+        
+        print "Dead Code:\n";
+        print "-" x 50 . "\n";
+        
+        for my $func_id (@dead_functions) {
+            my $func = $functions{$func_id};
+            print sprintf("%-30s %s:%d\n", $func->{name}, $func->{file}, $func->{line});
+        }
+    }
+}
+
+# Helper functions
+sub extract_visibility {
+    my ($ast_content, $func_name) = @_;
+    
+    # Look for visibility modifiers before function declaration
+    if ($ast_content =~ /\b(public|internal|fileprivate|private)\s+.*func\s+$func_name/) {
+        return $1;
+    }
+    
+    return 'internal'; # default visibility
+}
+
+# Add helper function for visibility extraction
+sub extract_visibility_from_ast {
+    my ($ast_content, $func_name) = @_;
+    return extract_visibility($ast_content, $func_name);
+}
+
+sub extract_line_number {
+    my ($content) = @_;
+    # This is a simplified implementation
+    return 1;
+}
+
+sub find_function_id_by_name {
+    my ($func_name, $file_hint) = @_;
+    
+    # Try exact match first
+    for my $func_id (keys %functions) {
+        return $func_id if $functions{$func_id}->{name} eq $func_name;
+    }
+    
+    # Try fuzzy match within same file if hint provided
+    if ($file_hint) {
+        for my $func_id (keys %functions) {
+            if ($functions{$func_id}->{file} eq $file_hint && 
+                $functions{$func_id}->{name} =~ /\Q$func_name\E/) {
+                return $func_id;
+            }
+        }
+    }
+    
+    return undef;
+}
+
+sub find_calling_function_context {
+    my ($ast_content, $position) = @_;
+    
+    # This is a simplified implementation
+    # In practice, you'd need more sophisticated AST traversal
+    my $before_content = substr($ast_content, 0, $position);
+    
+    # Find the last function declaration before this position
+    if ($before_content =~ /.*\(func_decl\s+"([^"]+)"/s) {
+        return $1;
+    }
+    
+    return undef;
+}
+
+# Main execution
+sub main {
+    GetOptions(
+        'project-path=s' => \$config{project_path},
+        'output=s' => \$config{output_format},
+        'include-tests!' => \$config{include_tests},
+        'verbose!' => \$config{verbose},
+        'help' => sub { print_usage(); exit 0; }
+    );
+    
+    my @dead_functions = analyze_project($config{project_path});
+    generate_report(@dead_functions);
+}
+
+sub print_usage {
+    print <<EOF;
+Usage: swift_dead_code_analyzer.pl [OPTIONS]
+
+Options:
+    --project-path PATH    Path to Swift project (default: current directory)
+    --output FORMAT        Output format: text|json (default: json)
+    --include-tests        Include test functions as entry points
+    --no-include-tests     Exclude test functions from entry points
+    --verbose              Enable verbose output
+    --help                 Show this help message
+
+Examples:
+    swift_dead_code_analyzer.pl --project-path ./MySwiftApp
+    swift_dead_code_analyzer.pl --output text --verbose
+    swift_dead_code_analyzer.pl --no-include-tests
+EOF
+}
+
+main() unless caller;
+
+1;
