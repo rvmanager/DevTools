@@ -63,11 +63,13 @@ private class FunctionVisitor: SyntaxVisitor {
     let location = sourceLocation(for: node)
     
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
-    
-    // *** THE FIX: Check if the function is part of a SwiftData @Model ***
     let isModelMethod = isEnclosedInModel(node: node)
     
-    let isEntryPoint = isOverridden || isModelMethod || checkForEntryPoint(node: node, name: funcName)
+    // *** THE FIX: A non-private method of any class is a potential entry point ***
+    let isPrivate = node.modifiers.contains { $0.name.text == "private" || $0.name.text == "fileprivate" }
+    let isNonPrivateClassMethod = isEnclosedInClass(node: node) && !isPrivate
+
+    let isEntryPoint = isOverridden || isModelMethod || isNonPrivateClassMethod || checkForEntryPoint(node: node, name: funcName)
 
     let definition = FunctionDefinition(
       id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
@@ -86,11 +88,13 @@ private class FunctionVisitor: SyntaxVisitor {
 
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isPublic = node.modifiers.contains { $0.name.text == "public" }
-    
-    // *** THE FIX: Check if the initializer is part of a SwiftData @Model ***
     let isModelMethod = isEnclosedInModel(node: node)
+    
+    // *** THE FIX: A non-private init of any class is a potential entry point ***
+    let isPrivate = node.modifiers.contains { $0.name.text == "private" || $0.name.text == "fileprivate" }
+    let isNonPrivateClassMethod = isEnclosedInClass(node: node) && !isPrivate
 
-    let isEntryPoint = isOverridden || isPublic || isModelMethod
+    let isEntryPoint = isOverridden || isPublic || isModelMethod || isNonPrivateClassMethod
 
     let definition = FunctionDefinition(
       id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
@@ -134,16 +138,16 @@ private class FunctionVisitor: SyntaxVisitor {
     while let parent = current?.parent {
       if let typeNode = parent.as(StructDeclSyntax.self) {
         context = typeNode.name.text + "." + context
-        break
+        // break // <- REMOVED
       } else if let typeNode = parent.as(ClassDeclSyntax.self) {
         context = typeNode.name.text + "." + context
-        break
+        // break // <- REMOVED
       } else if let typeNode = parent.as(EnumDeclSyntax.self) {
         context = typeNode.name.text + "." + context
-        break
+        // break // <- REMOVED
       } else if let typeNode = parent.as(ActorDeclSyntax.self) {
         context = typeNode.name.text + "." + context
-        break
+        // break // <- REMOVED
       }
       current = parent
     }
@@ -161,11 +165,9 @@ private class FunctionVisitor: SyntaxVisitor {
     return nil
   }
     
-  // *** NEW HELPER FUNCTION TO CHECK FOR @Model ATTRIBUTE ***
   private func isEnclosedInModel(node: SyntaxProtocol) -> Bool {
       var current: Syntax? = node._syntaxNode
       while let parent = current?.parent {
-          // Check if the parent is a class with the @Model attribute
           if let classDecl = parent.as(ClassDeclSyntax.self) {
               let hasModelAttribute = classDecl.attributes.contains { attr in
                   if let attribute = attr.as(AttributeSyntax.self),
@@ -178,10 +180,20 @@ private class FunctionVisitor: SyntaxVisitor {
                   return true
               }
           }
-          // Stop searching upwards once we hit the file's top level
-          if parent.is(SourceFileSyntax.self) {
-              break
+          if parent.is(SourceFileSyntax.self) { break }
+          current = parent
+      }
+      return false
+  }
+
+  // *** NEW HELPER FUNCTION TO CHECK FOR ENCLOSING CLASS ***
+  private func isEnclosedInClass(node: SyntaxProtocol) -> Bool {
+      var current: Syntax? = node._syntaxNode
+      while let parent = current?.parent {
+          if parent.is(ClassDeclSyntax.self) {
+              return true
           }
+          if parent.is(SourceFileSyntax.self) { break }
           current = parent
       }
       return false
