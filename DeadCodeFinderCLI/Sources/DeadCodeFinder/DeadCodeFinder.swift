@@ -5,7 +5,7 @@ import Foundation
 
 struct DeadCodeFinder: ParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "A tool to find unreachable Swift functions (dead code) in a project."
+    abstract: "A tool to find unused Swift code in a project using IndexStoreDB."
   )
 
   @Argument(help: "The root path of the Swift project to analyze.")
@@ -13,75 +13,49 @@ struct DeadCodeFinder: ParsableCommand {
 
   @Option(
     name: .shortAndLong,
-    help: "A comma-separated list of directories to exclude from analysis (e.g., '.build,Pods').")
-  private var exclude: String?
+    help: "The path to Xcode's Index Store. Found in your project's DerivedData directory.")
+  private var indexStorePath: String
 
   @Flag(name: .shortAndLong, help: "Enable verbose logging for detailed analysis steps.")
   private var verbose: Bool = false
 
   func run() throws {
     let absolutePath = (projectPath as NSString).expandingTildeInPath
+    let absoluteIndexStorePath = (indexStorePath as NSString).expandingTildeInPath
 
     log("Starting analysis of project at: \(absolutePath)")
+    log("Using Index Store at: \(absoluteIndexStorePath)")
 
-    let excludedDirs =
-      exclude?.components(separatedBy: ",") ?? [".build", "Pods", "Carthage", "DerivedData"]
-    log("Excluding directories: \(excludedDirs.joined(separator: ", "))")
+    // 1. Initialize the Index Store
+    let index = try IndexStore(storePath: absoluteIndexStorePath, projectPath: absolutePath)
 
-    // 1. Find all Swift files
-    var swiftFiles = ProjectParser.findSwiftFiles(at: absolutePath, excluding: excludedDirs)
+    // 2. Find all symbol definitions in the project
+    log("Finding all symbol definitions in project...")
+    let allSymbols = index.findAllSymbolDefinitions()
+    log("Found \(allSymbols.count) total symbol definitions.")
 
-    swiftFiles.removeAll { $0.lastPathComponent == "Package.swift" }
-
-    log("Found \(swiftFiles.count) Swift files to analyze.")
-
-    // 2. Parse files to find function definitions and calls
-    let analyzer = SyntaxAnalyzer(verbose: verbose)
-    let analysisResult = analyzer.analyze(files: swiftFiles)
-    log(
-      "Found \(analysisResult.definitions.count) function definitions and \(analysisResult.calls.count) call sites."
-    )
-    log("Identified \(analysisResult.entryPoints.count) potential entry points.")
-
-    // 3. Build the call graph
-    let callGraph = CallGraph(
-      definitions: analysisResult.definitions,
-      calls: analysisResult.calls,
-      entryPoints: analysisResult.entryPoints,
-      verbose: verbose
-    )
-
-    // 4. MODIFIED: Calculate call hierarchy for all functions
-    log("Calculating call hierarchy for all functions...")
-    let callHierarchy = callGraph.calculateCallHierarchy()
-    log("Calculation complete.")
-
-    // 5. Report results
-    report(callHierarchy)
+    // 3. Analyze for unused symbols
+    log("Analyzing for unused symbols...")
+    let unusedSymbols = index.findUnusedSymbols(in: allSymbols)
+    log("Analysis complete.")
+    
+    // 4. Report results
+    report(unusedSymbols)
   }
 
-  // MODIFIED: This function is completely rewritten for the new output format.
-  private func report(_ callHierarchy: [CallHierarchyInfo]) {
-    // Sort the results by call level, lowest first.
-    let sortedHierarchy = callHierarchy.sorted {
-      if $0.level != $1.level {
-        return $0.level < $1.level
+  private func report(_ unusedSymbols: [SymbolDefinition]) {
+    if unusedSymbols.isEmpty {
+      print("\n✅ No unused symbols found. Excellent!")
+    } else {
+      print("\n❌ Found \(unusedSymbols.count) potentially unused symbols:")
+      let sortedSymbols = unusedSymbols.sorted {
+        $0.location.filePath < $1.location.filePath
+          || ($0.location.filePath == $1.location.filePath && $0.location.line < $1.location.line)
       }
-      if $0.function.location.filePath != $1.function.location.filePath {
-        return $0.function.location.filePath < $1.function.location.filePath
+      for symbol in sortedSymbols {
+        // Example Output: /path/to/File.swift:42 -> myFunction() [function.method.instance]
+        print("  - \(symbol.location.description) -> \(symbol.name) [\(symbol.kind)]")
       }
-      return $0.function.location.line < $1.function.location.line
-    }
-
-    print("\n--- Function Call Hierarchy Report ---")
-    for info in sortedHierarchy {
-      let location = "\(info.function.location.filePath):\(info.function.location.line)"
-      let funcName = info.function.name
-      let highestCallerName = info.highestCaller?.name ?? "<none>"
-      let level = info.level
-
-      // Print in the requested tab-separated format.
-      print("\(location)\t\(funcName)\t\(highestCallerName)\t\(level)")
     }
   }
 

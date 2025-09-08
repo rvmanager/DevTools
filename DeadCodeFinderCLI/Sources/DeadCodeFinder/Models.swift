@@ -2,28 +2,21 @@
 
 import Foundation
 
-struct SourceLocation {
+// Represents a location in a source file.
+struct SourceLocation: CustomStringConvertible {
   let filePath: String
   let line: Int
   let column: Int
+    
+  var description: String {
+    "\(filePath):\(line):\(column)"
+  }
 }
 
-struct FunctionDefinition {
-  let id: UUID
-  let name: String
+// Represents a defined symbol (class, function, etc.) found in the index.
+struct SymbolDefinition {
+  let usr: String          // The unique, stable identifier for the symbol.
+  let name: String         // The human-readable name of the symbol.
+  let kind: String         // The kind of symbol (e.g., "class", "function.method.instance").
   let location: SourceLocation
-  let isEntryPoint: Bool
-}
-
-struct FunctionCall {
-  let callerName: String
-  let calleeName: String
-  let location: SourceLocation
-}
-
-// NEW: A model to hold the calculated hierarchy details for each function.
-struct CallHierarchyInfo {
-  let function: FunctionDefinition
-  let highestCaller: FunctionDefinition?
-  let level: Int
 }
