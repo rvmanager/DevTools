@@ -3,12 +3,12 @@
 import Foundation
 
 enum DefinitionKind: String {
-    case `struct`
-    case `class`
-    case `enum`
-    case function
-    case initializer
-    case variable
+  case `struct`
+  case `class`
+  case `enum`
+  case function
+  case initializer
+  case variable
 }
 
 struct SourceDefinition {
@@ -41,7 +41,7 @@ struct SourceLocation {
   let filePath: String
   let line: Int
   let column: Int
-  let utf8Column: Int // <-- FIXED: Added property to store the UTF-8 byte offset column
+  let utf8Column: Int
   let endLine: Int
   let endColumn: Int
 

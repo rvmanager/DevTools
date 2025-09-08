@@ -1,4 +1,4 @@
-// DeadCodeFinder/SyntaxAnalyzer.swift
+// Sources/DeadCodeFinder/SyntaxAnalyzer.swift
 
 import Foundation
 import SwiftParser
@@ -24,62 +24,63 @@ class SyntaxAnalyzer: @unchecked Sendable {
 
     log("Starting concurrent analysis of \(files.count) files...")
     DispatchQueue.concurrentPerform(iterations: files.count) { index in
-        let fileURL = files[index]
-        log("Parsing \(fileURL.path)...")
-        do {
-            let source = try String(contentsOf: fileURL, encoding: .utf8)
-            let sourceTree = Parser.parse(source: source)
+      let fileURL = files[index]
+      log("Parsing \(fileURL.path)...")
+      do {
+        let source = try String(contentsOf: fileURL, encoding: .utf8)
+        let sourceTree = Parser.parse(source: source)
 
-            let visitor = FunctionVisitor(fileURL: fileURL, verbose: verbose)
-            visitor.walk(sourceTree)
+        let visitor = FunctionVisitor(fileURL: fileURL, verbose: verbose)
+        visitor.walk(sourceTree)
 
-            definitions.append(contentsOf: visitor.definitions)
-            calls.append(contentsOf: visitor.calls)
-            let fileEntryPoints = visitor.definitions.filter { $0.isEntryPoint }
-            if !fileEntryPoints.isEmpty {
-                 entryPoints.append(contentsOf: fileEntryPoints)
-            }
-            log("Finished parsing \(fileURL.path). Found \(visitor.definitions.count) definitions.")
-
-        } catch {
-            print("[ERROR] Error parsing file \(fileURL.path): \(error)")
+        definitions.append(contentsOf: visitor.definitions)
+        calls.append(contentsOf: visitor.calls)
+        let fileEntryPoints = visitor.definitions.filter { $0.isEntryPoint }
+        if !fileEntryPoints.isEmpty {
+          entryPoints.append(contentsOf: fileEntryPoints)
         }
+        log("Finished parsing \(fileURL.path). Found \(visitor.definitions.count) definitions.")
+
+      } catch {
+        print("[ERROR] Error parsing file \(fileURL.path): \(error)")
+      }
     }
-    
+
     log("Finished all concurrent analysis.")
     return AnalysisResult(
-        definitions: definitions.items,
-        calls: calls.items,
-        entryPoints: entryPoints.items
+      definitions: definitions.items,
+      calls: calls.items,
+      entryPoints: entryPoints.items
     )
   }
 
   private func log(_ message: String) {
-      if verbose {
-          print("[SYNTAX] \(message)")
-      }
+    if verbose {
+      print("[SYNTAX] \(message)")
+    }
   }
 }
 
 // Thread-safe array wrapper to fix concurrency warnings
 private class ThreadSafeArray<T: Sendable>: @unchecked Sendable {
-    private var _items: [T] = []
-    private let queue = DispatchQueue(label: "com.deadcodefinder.threadsafe-array", attributes: .concurrent)
-    
-    var items: [T] {
-        var itemsCopy: [T]!
-        queue.sync {
-            itemsCopy = self._items
-        }
-        return itemsCopy
+  private var _items: [T] = []
+  private let queue = DispatchQueue(
+    label: "com.deadcodefinder.threadsafe-array", attributes: .concurrent)
+
+  var items: [T] {
+    var itemsCopy: [T]!
+    queue.sync {
+      itemsCopy = self._items
     }
-    
-    func append(contentsOf newItems: [T]) {
-        guard !newItems.isEmpty else { return }
-        queue.async(flags: .barrier) {
-            self._items.append(contentsOf: newItems)
-        }
+    return itemsCopy
+  }
+
+  func append(contentsOf newItems: [T]) {
+    guard !newItems.isEmpty else { return }
+    queue.async(flags: .barrier) {
+      self._items.append(contentsOf: newItems)
     }
+  }
 }
 
 private class FunctionVisitor: SyntaxVisitor {
@@ -95,146 +96,157 @@ private class FunctionVisitor: SyntaxVisitor {
     self.verbose = verbose
     super.init(viewMode: .sourceAccurate)
   }
-    
+
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
-      let name = node.name.text
-      let fullName = createUniqueName(functionName: name, node: node)
-      // FIXED: Get location of the name token, not the whole node.
-      let location = sourceLocation(for: node.name)
-      
-      var isEntryPoint = false
-      if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
-          isEntryPoint = inheritedTypes.contains {
-              let typeDescription = $0.type.description
-              let isEntryPointType = typeDescription.contains("View") || typeDescription.contains("App") || typeDescription.contains("ParsableCommand")
-              if isEntryPointType && verbose {
-                  log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
-              }
-              return isEntryPointType
-          }
-      }
-      if node.attributes.contains(where: { $0.as(AttributeSyntax.self)?.attributeName.description == "main" }) {
-          isEntryPoint = true
-          if verbose { log("Marking '\(fullName)' as entry point due to @main attribute") }
-      }
-
-      let definition = SourceDefinition(
-          name: fullName,
-          kind: .struct,
-          location: location,
-          isEntryPoint: isEntryPoint
-      )
-      definitions.append(definition)
-      functionContextStack.append(fullName)
-      return .visitChildren
-  }
-    
-  override func visitPost(_ node: StructDeclSyntax) {
-      _ = functionContextStack.popLast()
-  }
-    
-  override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
-      let name = node.name.text
-      let fullName = createUniqueName(functionName: name, node: node)
-      // FIXED: Get location of the name token, not the whole node.
-      let location = sourceLocation(for: node.name)
-      
-      var isEntryPoint = false
-      if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
-          isEntryPoint = inheritedTypes.contains {
-              let typeDescription = $0.type.description
-              let isEntryPointType = typeDescription.contains("XCTestCase")
-              if isEntryPointType && verbose {
-                  log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
-              }
-              return isEntryPointType
-          }
-      }
-      
-      let definition = SourceDefinition(
-          name: fullName,
-          kind: .class,
-          location: location,
-          isEntryPoint: isEntryPoint
-      )
-      definitions.append(definition)
-      functionContextStack.append(fullName)
-      return .visitChildren
-  }
-    
-  override func visitPost(_ node: ClassDeclSyntax) {
-      _ = functionContextStack.popLast()
-  }
-    
-  override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
-      let name = node.name.text
-      let fullName = createUniqueName(functionName: name, node: node)
-      // FIXED: Get location of the name token, not the whole node.
-      let location = sourceLocation(for: node.name)
-      
-      let definition = SourceDefinition(
-          name: fullName,
-          kind: .enum,
-          location: location,
-          isEntryPoint: false
-      )
-      definitions.append(definition)
-      functionContextStack.append(fullName)
-      return .visitChildren
-  }
-    
-  override func visitPost(_ node: EnumDeclSyntax) {
-      _ = functionContextStack.popLast()
-  }
-
-  override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-    guard let binding = node.bindings.first, let pattern = binding.pattern.as(IdentifierPatternSyntax.self) else {
-        return .visitChildren
-    }
-
-    // Only consider computed properties with explicit get/set blocks
-    guard binding.accessorBlock != nil else {
-        return .visitChildren
-    }
-
-    let varName = pattern.identifier.text
-    let fullName = createUniqueName(functionName: varName, node: node)
-    // FIXED: Get location of the pattern (the variable name), not the whole node.
-    let location = sourceLocation(for: pattern)
+    let name = node.name.text
+    let fullName = createUniqueName(functionName: name, node: node)
+    let location = sourceLocation(for: node.name)
 
     var isEntryPoint = false
-    if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
-      if parentStruct.inheritanceClause?.inheritedTypes.contains(where: {
+    if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
+      isEntryPoint = inheritedTypes.contains {
         let typeDescription = $0.type.description
-        let isEntryPointType = typeDescription.contains("View") || typeDescription.contains("App")
-         if isEntryPointType && verbose {
-            log("Marking '\(fullName)' as entry point because it is a 'body' in a View/App")
+        let isEntryPointType =
+          typeDescription.contains("View") || typeDescription.contains("App")
+          || typeDescription.contains("ParsableCommand")
+        if isEntryPointType && verbose {
+          log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
         }
         return isEntryPointType
-      }) == true {
-        isEntryPoint = true
+      }
+    }
+    if node.attributes.contains(where: {
+      $0.as(AttributeSyntax.self)?.attributeName.description == "main"
+    }) {
+      isEntryPoint = true
+      if verbose { log("Marking '\(fullName)' as entry point due to @main attribute") }
+    }
+
+    let definition = SourceDefinition(
+      name: fullName,
+      kind: .struct,
+      location: location,
+      isEntryPoint: isEntryPoint
+    )
+    definitions.append(definition)
+    functionContextStack.append(fullName)
+    return .visitChildren
+  }
+
+  override func visitPost(_ node: StructDeclSyntax) {
+    _ = functionContextStack.popLast()
+  }
+
+  override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
+    let name = node.name.text
+    let fullName = createUniqueName(functionName: name, node: node)
+    let location = sourceLocation(for: node.name)
+
+    var isEntryPoint = false
+    if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
+      isEntryPoint = inheritedTypes.contains {
+        let typeDescription = $0.type.description
+        let isEntryPointType = typeDescription.contains("XCTestCase")
+        if isEntryPointType && verbose {
+          log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
+        }
+        return isEntryPointType
       }
     }
 
     let definition = SourceDefinition(
-        name: fullName, kind: .variable, location: location, isEntryPoint: isEntryPoint
+      name: fullName,
+      kind: .class,
+      location: location,
+      isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
     functionContextStack.append(fullName)
+    return .visitChildren
+  }
 
+  override func visitPost(_ node: ClassDeclSyntax) {
+    _ = functionContextStack.popLast()
+  }
+
+  override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
+    let name = node.name.text
+    let fullName = createUniqueName(functionName: name, node: node)
+    let location = sourceLocation(for: node.name)
+
+    let definition = SourceDefinition(
+      name: fullName,
+      kind: .enum,
+      location: location,
+      isEntryPoint: false
+    )
+    definitions.append(definition)
+    functionContextStack.append(fullName)
+    return .visitChildren
+  }
+
+  override func visitPost(_ node: EnumDeclSyntax) {
+    _ = functionContextStack.popLast()
+  }
+
+  // --- REFINED VARIABLE VISITOR ---
+  override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
+    // We only want to capture top-level computed properties, not local variables.
+    // A simple proxy for this is to check if we are currently inside a function context.
+    guard functionContextStack.last?.contains("(") != true else {
+      return .visitChildren
+    }
+
+    for binding in node.bindings {
+      // Ensure we are looking at a computed property (has an accessor block)
+      guard binding.accessorBlock != nil,
+        let pattern = binding.pattern.as(IdentifierPatternSyntax.self)
+      else {
+        continue
+      }
+
+      let varName = pattern.identifier.text
+      let fullName = createUniqueName(functionName: varName, node: node)
+      let location = sourceLocation(for: pattern.identifier)
+
+      var isEntryPoint = false
+      if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
+        if parentStruct.inheritanceClause?.inheritedTypes.contains(where: {
+          let typeDescription = $0.type.description
+          let isEntryPointType = typeDescription.contains("View") || typeDescription.contains("App")
+          if isEntryPointType && verbose {
+            log("Marking '\(fullName)' as entry point because it is a 'body' in a View/App")
+          }
+          return isEntryPointType
+        }) == true {
+          isEntryPoint = true
+        }
+      }
+
+      let definition = SourceDefinition(
+        name: fullName, kind: .variable, location: location, isEntryPoint: isEntryPoint
+      )
+      definitions.append(definition)
+      functionContextStack.append(fullName)
+    }
     return .visitChildren
   }
 
   override func visitPost(_ node: VariableDeclSyntax) {
-    if let binding = node.bindings.first, binding.accessorBlock != nil {
-      _ = functionContextStack.popLast()
+    for binding in node.bindings {
+      if binding.accessorBlock != nil,
+        binding.pattern.as(IdentifierPatternSyntax.self) != nil,
+        functionContextStack.last?.contains("(") != true
+      {
+        _ = functionContextStack.popLast()
+      }
     }
   }
+  // --- END REFINED VARIABLE VISITOR ---
 
   override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
     let funcName = node.name.text
     let fullName = createUniqueName(functionName: funcName, node: node)
-    // FIXED: Get location of the name token, not the whole node.
     let location = sourceLocation(for: node.name)
 
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
@@ -243,21 +255,23 @@ private class FunctionVisitor: SyntaxVisitor {
       $0.name.text == "private" || $0.name.text == "fileprivate"
     }
     let isNonPrivateClassMethod = isEnclosedInClass(node: node) && !isPrivate
-    let isEntryPointByHeuristics = checkForEntryPoint(node: node, name: funcName, fullName: fullName)
-    
-    let isEntryPoint = isOverridden || isModelMethod || isNonPrivateClassMethod || isEntryPointByHeuristics
+    let isEntryPointByHeuristics = checkForEntryPoint(
+      node: node, name: funcName, fullName: fullName)
+
+    let isEntryPoint =
+      isOverridden || isModelMethod || isNonPrivateClassMethod || isEntryPointByHeuristics
 
     if verbose && isEntryPoint {
-        var reasons: [String] = []
-        if isOverridden { reasons.append("is override") }
-        if isModelMethod { reasons.append("is SwiftData @Model method") }
-        if isNonPrivateClassMethod { reasons.append("is non-private class method") }
-        if isEntryPointByHeuristics { reasons.append("heuristic match") }
-        log("Marking '\(fullName)' as entry point (\(reasons.joined(separator: ", ")))")
+      var reasons: [String] = []
+      if isOverridden { reasons.append("is override") }
+      if isModelMethod { reasons.append("is SwiftData @Model method") }
+      if isNonPrivateClassMethod { reasons.append("is non-private class method") }
+      if isEntryPointByHeuristics { reasons.append("heuristic match") }
+      log("Marking '\(fullName)' as entry point (\(reasons.joined(separator: ", ")))")
     }
 
     let definition = SourceDefinition(
-        name: fullName, kind: .function, location: location, isEntryPoint: isEntryPoint
+      name: fullName, kind: .function, location: location, isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
     functionContextStack.append(fullName)
@@ -270,7 +284,6 @@ private class FunctionVisitor: SyntaxVisitor {
 
   override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
     let fullName = createUniqueName(functionName: "init", node: node)
-    // FIXED: Get location of the 'init' keyword.
     let location = sourceLocation(for: node.initKeyword)
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isPublic = node.modifiers.contains { $0.name.text == "public" }
@@ -281,17 +294,17 @@ private class FunctionVisitor: SyntaxVisitor {
     let isNonPrivateClassMethod = isEnclosedInClass(node: node) && !isPrivate
     let isEntryPoint = isOverridden || isPublic || isModelMethod || isNonPrivateClassMethod
 
-     if verbose && isEntryPoint {
-        var reasons: [String] = []
-        if isOverridden { reasons.append("is override") }
-        if isPublic { reasons.append("is public") }
-        if isModelMethod { reasons.append("is SwiftData @Model method") }
-        if isNonPrivateClassMethod { reasons.append("is non-private class method") }
-        log("Marking '\(fullName)' as entry point (\(reasons.joined(separator: ", ")))")
+    if verbose && isEntryPoint {
+      var reasons: [String] = []
+      if isOverridden { reasons.append("is override") }
+      if isPublic { reasons.append("is public") }
+      if isModelMethod { reasons.append("is SwiftData @Model method") }
+      if isNonPrivateClassMethod { reasons.append("is non-private class method") }
+      log("Marking '\(fullName)' as entry point (\(reasons.joined(separator: ", ")))")
     }
 
     let definition = SourceDefinition(
-        name: fullName, kind: .initializer, location: location, isEntryPoint: isEntryPoint
+      name: fullName, kind: .initializer, location: location, isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
     functionContextStack.append(fullName)
@@ -333,7 +346,7 @@ private class FunctionVisitor: SyntaxVisitor {
     guard let firstChar = calleeName.first, firstChar.isLowercase else {
       return .visitChildren
     }
-      
+
     let callerShortName = String(callerName.split(separator: ".").last ?? "")
     if callerShortName == calleeName {
       return .visitChildren
@@ -349,9 +362,9 @@ private class FunctionVisitor: SyntaxVisitor {
   // MARK: - Helpers
 
   private func log(_ message: String) {
-      if verbose {
-           print("[VISITOR] \(message)")
-      }
+    if verbose {
+      print("[VISITOR] \(message)")
+    }
   }
 
   private func createUniqueName(functionName: String, node: SyntaxProtocol) -> String {
@@ -367,8 +380,8 @@ private class FunctionVisitor: SyntaxVisitor {
       } else if let typeNode = parent.as(ActorDeclSyntax.self) {
         context = typeNode.name.text + "." + context
       } else if let typeNode = parent.as(ExtensionDeclSyntax.self) {
-          context = typeNode.extendedType.trimmedDescription + "." + context
-          break
+        context = typeNode.extendedType.trimmedDescription + "." + context
+        break
       }
       current = parent
     }
@@ -419,7 +432,8 @@ private class FunctionVisitor: SyntaxVisitor {
     return false
   }
 
-  private func checkForEntryPoint(node: FunctionDeclSyntax, name: String, fullName: String) -> Bool {
+  private func checkForEntryPoint(node: FunctionDeclSyntax, name: String, fullName: String) -> Bool
+  {
     if name == "main", let parent = node.parent?.parent?.parent,
       let decl = parent.asProtocol(WithAttributesSyntax.self)
     {
@@ -471,22 +485,22 @@ private class FunctionVisitor: SyntaxVisitor {
   private func sourceLocation(for node: SyntaxProtocol) -> SourceLocation {
     let converter = SourceLocationConverter(
       fileName: fileURL.path, tree: node.root.as(SourceFileSyntax.self)!)
-      
+
     let startPosition = node.positionAfterSkippingLeadingTrivia
     let start = converter.location(for: startPosition)
     let end = node.endLocation(converter: converter)
 
     let lineStartPosition = converter.position(ofLine: start.line, column: 1)
-    
+
     let utf8Column = start.offset - lineStartPosition.utf8Offset + 1
-    
+
     return SourceLocation(
-        filePath: fileURL.path,
-        line: start.line,
-        column: start.column,
-        utf8Column: utf8Column,
-        endLine: end.line,
-        endColumn: end.column
+      filePath: fileURL.path,
+      line: start.line,
+      column: start.column,
+      utf8Column: utf8Column,
+      endLine: end.line,
+      endColumn: end.column
     )
   }
 }
