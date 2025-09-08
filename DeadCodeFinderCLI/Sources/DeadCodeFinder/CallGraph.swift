@@ -22,36 +22,41 @@ class CallGraph {
     }
 
     private func buildGraph(index: IndexStoreDB) {
-        if verbose { print("Building accurate call graph from \(definitions.count) definitions...") }
+        log("Building accurate call graph from \(definitions.count) definitions...")
 
-        // 1. Create a more robust spatial lookup map that understands source ranges.
-        // [FilePath: [Sorted list of (line range, USR)]]
         var fileRangeToUsrMap: [String: [(Range<Int>, String)]] = [:]
         for definition in definitions where definition.usr != nil {
             let range = definition.location.line ..< definition.location.endLine + 1
             fileRangeToUsrMap[definition.location.filePath, default: []].append((range, definition.usr!))
         }
 
-        // Sort the ranges for each file to allow for efficient searching.
+        // Sort ranges to allow for efficient lookup later
         for (filePath, ranges) in fileRangeToUsrMap {
             fileRangeToUsrMap[filePath] = ranges.sorted { $0.0.lowerBound < $1.0.lowerBound }
         }
         
-        // 2. For each definition, find what other symbols reference it.
+        log("Processing definitions to find references...")
+        var count = 0
         for calleeDef in definitions {
+            count += 1
+            if verbose && count % 100 == 0 {
+                log("...processed \(count)/\(definitions.count) definitions for references")
+            }
             guard let calleeUsr = calleeDef.usr else { continue }
 
+            // Find all places where this symbol is referenced.
             let references = index.occurrences(ofUSR: calleeUsr, roles: .reference)
 
             for reference in references {
-                // Find which definition contains this reference by checking our range map.
                 guard let rangesInFile = fileRangeToUsrMap[reference.location.path] else {
+                    // This can happen if the reference is in a file we are not analyzing (e.g., system frameworks)
                     continue
                 }
 
-                // Find the tightest-fitting range that contains the reference line.
+                // Find which definition contains this reference's location.
+                // We search backwards because definitions can be nested.
                 var containingUsr: String?
-                for (range, usr) in rangesInFile.reversed() { // Reverse search finds inner scopes first
+                for (range, usr) in rangesInFile.reversed() {
                     if range.contains(reference.location.line) {
                         containingUsr = usr
                         break
@@ -59,13 +64,19 @@ class CallGraph {
                 }
                 
                 guard let callerUsr = containingUsr else {
-                    if verbose { log("Could not map reference at \(reference.location.path):\(reference.location.line) to a known definition.") }
+                    log("Could not map reference at \(reference.location.path):\(reference.location.line) to a known definition.")
                     continue
                 }
 
-                // Don't add edges from a symbol to itself.
+                // A function calling itself is not an edge we need to track for reachability from an entry point.
                 if callerUsr == calleeUsr {
                     continue
+                }
+                
+                if verbose {
+                    let callerName = usrToDefinition[callerUsr]?.name ?? "Unknown"
+                    let calleeName = calleeDef.name
+                    log("[GRAPH EDGE] \(callerName) -> \(calleeName) at \(reference.location.path):\(reference.location.line)")
                 }
 
                 adjacencyList[callerUsr, default: Set()].insert(calleeUsr)
@@ -73,10 +84,8 @@ class CallGraph {
             }
         }
 
-        if verbose {
-            let edgeCount = adjacencyList.values.reduce(0) { $0 + $1.count }
-            print("Accurate call graph built with \(definitions.count) nodes and \(edgeCount) edges.")
-        }
+        let edgeCount = adjacencyList.values.reduce(0) { $0 + $1.count }
+        log("Accurate call graph built with \(definitions.count) nodes and \(edgeCount) edges.")
     }
     
     private func log(_ message: String) {

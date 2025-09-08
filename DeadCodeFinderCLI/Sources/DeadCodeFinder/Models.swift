@@ -20,7 +20,8 @@ struct SourceDefinition {
   var isEntryPoint: Bool
 }
 
-// NOTE: The following structs are no longer used by the final analysis pipeline.
+// RESTORED: These structs need their properties for SyntaxAnalyzer to compile.
+// Even though they aren't used in the final analysis, they are still populated during the parsing stage.
 struct FunctionCall {
   let callerName: String
   let calleeName: String
@@ -28,10 +29,13 @@ struct FunctionCall {
 }
 
 struct CallHierarchyInfo {
-  let function: SourceDefinition // Changed from FunctionDefinition
-  let highestCaller: SourceDefinition? // Changed from FunctionDefinition
+  let function: SourceDefinition
+  let highestCaller: SourceDefinition?
   let level: Int
 }
+
+// This alias is still helpful to avoid breaking older files that haven't been refactored yet.
+typealias FunctionDefinition = SourceDefinition
 
 struct SourceLocation {
   let filePath: String

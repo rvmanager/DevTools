@@ -23,11 +23,27 @@ struct DeadCodeFinder: ParsableCommand {
     @Flag(name: .shortAndLong, help: "Enable verbose logging for detailed analysis steps.")
     private var verbose: Bool = false
 
+    func validate() throws {
+        log("Validating input paths...")
+        let absolutePath = resolveAbsolutePath(projectPath)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: absolutePath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ValidationError("Project path does not exist or is not a directory: \(absolutePath)")
+        }
+        log("Project path is valid: \(absolutePath)")
+        
+        let absoluteIndexStorePath = resolveAbsolutePath(indexStorePath)
+        guard FileManager.default.fileExists(atPath: absoluteIndexStorePath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ValidationError("Index store path does not exist or is not a directory: \(absoluteIndexStorePath)")
+        }
+        log("Index store path is valid: \(absoluteIndexStorePath)")
+    }
+
     func run() throws {
         let absolutePath = resolveAbsolutePath(projectPath)
         let absoluteIndexStorePath = resolveAbsolutePath(indexStorePath)
 
-        log("Starting analysis of project at: \(absolutePath)")
+        log("🚀 Starting analysis of project at: \(absolutePath)")
         log("Using Index Store at: \(absoluteIndexStorePath)")
 
         let excludedDirs =
@@ -35,31 +51,45 @@ struct DeadCodeFinder: ParsableCommand {
         log("Excluding directories: \(excludedDirs.joined(separator: ", "))")
 
         // --- STAGE 1: DECLARATION INVENTORY (SwiftSyntax) ---
+        log("--- STAGE 1: Parsing Swift files ---")
         let swiftFiles = ProjectParser.findSwiftFiles(at: absolutePath, excluding: excludedDirs)
         log("Found \(swiftFiles.count) Swift files to analyze.")
 
         let analyzer = SyntaxAnalyzer(verbose: verbose)
         let analysisResult = analyzer.analyze(files: swiftFiles)
         log("Found \(analysisResult.definitions.count) definitions (structs, classes, functions, etc.).")
-        log("Identified \(analysisResult.entryPoints.count) potential entry points.")
+        log("Identified \(analysisResult.entryPoints.count) potential entry points from syntax.")
+        
+        if verbose {
+            log("Detailed Entry Points Report (from syntax):")
+            for entryPoint in analysisResult.entryPoints {
+                log("  - [SYNTAX ENTRY POINT] \(entryPoint.name) at \(entryPoint.location.description)")
+            }
+        }
         
         // --- STAGE 2: SYMBOL HYDRATION (IndexStoreDB) ---
+        log("--- STAGE 2: Hydrating Symbols with USRs ---")
         log("Connecting to Index Store...")
-        let index = try IndexStore(storePath: absoluteIndexStorePath)
+        let index = try IndexStore(storePath: absoluteIndexStorePath, verbose: verbose)
         
         log("Hydrating \(analysisResult.definitions.count) definitions with USRs...")
         var hydratedDefinitions = [SourceDefinition]()
         var fileOccurrencesCache: [String: [SymbolOccurrence]] = [:]
+        var hydratedCount = 0
+        var unhydratedCount = 0
 
         for var definition in analysisResult.definitions {
             let filePath = definition.location.filePath
             
+            // Cache occurrences per file to avoid repeated lookups
             if fileOccurrencesCache[filePath] == nil {
+                log("Caching symbols for file: \(filePath)")
                 fileOccurrencesCache[filePath] = index.store.symbolOccurrences(inFilePath: filePath)
             }
             
             guard let occurrencesInFile = fileOccurrencesCache[filePath] else { continue }
             
+            // Find the symbol occurrence that matches our definition's location
             let match = occurrencesInFile.first { occ in
                 return occ.location.line == definition.location.line
                     && occ.location.utf8Column == definition.location.column
@@ -69,21 +99,27 @@ struct DeadCodeFinder: ParsableCommand {
             if let defOccurrence = match, !defOccurrence.symbol.usr.isEmpty {
                 definition.usr = defOccurrence.symbol.usr
                 hydratedDefinitions.append(definition)
+                hydratedCount += 1
+                if verbose {
+                    log("[HYDRATED] '\(definition.name)' -> USR: \(definition.usr ?? "N/A")")
+                }
             } else {
-                if verbose { log("Warning: Could not find USR for \(definition.name) at \(definition.location.description)") }
+                unhydratedCount += 1
+                log("[HYDRATION WARNING] Could not find USR for \(definition.name) at \(definition.location.description)")
             }
         }
-        log("Successfully hydrated \(hydratedDefinitions.count) definitions.")
+        log("Successfully hydrated \(hydratedCount) definitions. Failed to hydrate \(unhydratedCount).")
         
         // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
-        log("Building accurate call graph...")
+        log("--- STAGE 3: Building Call Graph ---")
         let callGraph = CallGraph(definitions: hydratedDefinitions, index: index, verbose: verbose)
         
         // --- STAGE 4: REACHABILITY ANALYSIS ---
-        log("Analyzing for unreachable (dead) code...")
+        log("--- STAGE 4: Analyzing for Unreachable Code ---")
         let detector = DeadCodeDetector(graph: callGraph, verbose: verbose)
         let deadSymbols = detector.findDeadCode()
-        log("Analysis complete.")
+        
+        log("Analysis complete. Found \(deadSymbols.count) dead symbols.")
 
         // --- REPORTING ---
         report(deadSymbols)
@@ -105,8 +141,11 @@ struct DeadCodeFinder: ParsableCommand {
     }
 
     private func log(_ message: String) {
-        if verbose {
-            print("[INFO] \(message)")
+        // Always print high-level info, use verbose for detailed steps
+        if message.starts(with: "---") || message.starts(with: "🚀") || !verbose {
+             print("[INFO] \(message)")
+        } else if verbose {
+             print("[DEBUG] \(message)")
         }
     }
     
