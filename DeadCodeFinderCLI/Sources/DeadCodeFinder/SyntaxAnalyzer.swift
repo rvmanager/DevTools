@@ -62,9 +62,12 @@ private class FunctionVisitor: SyntaxVisitor {
     let fullName = createUniqueName(functionName: funcName, node: node)
     let location = sourceLocation(for: node)
     
-    // *** THE FIX: An overridden function is an entry point. ***
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
-    let isEntryPoint = isOverridden || checkForEntryPoint(node: node, name: funcName)
+    
+    // *** THE FIX: Check if the function is part of a SwiftData @Model ***
+    let isModelMethod = isEnclosedInModel(node: node)
+    
+    let isEntryPoint = isOverridden || isModelMethod || checkForEntryPoint(node: node, name: funcName)
 
     let definition = FunctionDefinition(
       id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
@@ -81,10 +84,13 @@ private class FunctionVisitor: SyntaxVisitor {
     let fullName = createUniqueName(functionName: "init", node: node)
     let location = sourceLocation(for: node)
 
-    // *** THE FIX: An overridden initializer is an entry point. ***
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isPublic = node.modifiers.contains { $0.name.text == "public" }
-    let isEntryPoint = isOverridden || isPublic
+    
+    // *** THE FIX: Check if the initializer is part of a SwiftData @Model ***
+    let isModelMethod = isEnclosedInModel(node: node)
+
+    let isEntryPoint = isOverridden || isPublic || isModelMethod
 
     let definition = FunctionDefinition(
       id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
@@ -153,6 +159,32 @@ private class FunctionVisitor: SyntaxVisitor {
       current = parent
     }
     return nil
+  }
+    
+  // *** NEW HELPER FUNCTION TO CHECK FOR @Model ATTRIBUTE ***
+  private func isEnclosedInModel(node: SyntaxProtocol) -> Bool {
+      var current: Syntax? = node._syntaxNode
+      while let parent = current?.parent {
+          // Check if the parent is a class with the @Model attribute
+          if let classDecl = parent.as(ClassDeclSyntax.self) {
+              let hasModelAttribute = classDecl.attributes.contains { attr in
+                  if let attribute = attr.as(AttributeSyntax.self),
+                     let identifier = attribute.attributeName.as(IdentifierTypeSyntax.self) {
+                      return identifier.name.text == "Model"
+                  }
+                  return false
+              }
+              if hasModelAttribute {
+                  return true
+              }
+          }
+          // Stop searching upwards once we hit the file's top level
+          if parent.is(SourceFileSyntax.self) {
+              break
+          }
+          current = parent
+      }
+      return false
   }
 
   private func checkForEntryPoint(node: FunctionDeclSyntax, name: String) -> Bool {
