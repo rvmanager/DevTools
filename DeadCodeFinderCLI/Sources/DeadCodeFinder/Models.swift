@@ -7,7 +7,7 @@ struct SourceLocation: CustomStringConvertible {
   let filePath: String
   let line: Int
   let column: Int
-    
+
   var description: String {
     "\(filePath):\(line):\(column)"
   }
@@ -15,8 +15,8 @@ struct SourceLocation: CustomStringConvertible {
 
 // Represents a defined symbol (class, function, etc.) found in the index.
 struct SymbolDefinition {
-  let usr: String          // The unique, stable identifier for the symbol.
-  let name: String         // The human-readable name of the symbol.
-  let kind: String         // The kind of symbol (e.g., "class", "function.method.instance").
+  let usr: String
+  let name: String
+  let kind: String
   let location: SourceLocation
 }

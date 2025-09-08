@@ -1,3 +1,5 @@
+// Sources/DeadCodeFinder/DeadCodeFinder.swift
+
 import ArgumentParser
 import Foundation
 
@@ -28,9 +30,14 @@ struct DeadCodeFinder: ParsableCommand {
     // Validate that the project path exists and is a directory
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: absolutePath, isDirectory: &isDirectory),
-          isDirectory.boolValue else {
-      throw NSError(domain: "DeadCodeFinder", code: 1, 
-                   userInfo: [NSLocalizedDescriptionKey: "Project path does not exist or is not a directory: \(absolutePath)"])
+      isDirectory.boolValue
+    else {
+      throw NSError(
+        domain: "DeadCodeFinder", code: 1,
+        userInfo: [
+          NSLocalizedDescriptionKey:
+            "Project path does not exist or is not a directory: \(absolutePath)"
+        ])
     }
 
     // 1. Initialize the Index Store
@@ -45,7 +52,7 @@ struct DeadCodeFinder: ParsableCommand {
     log("Analyzing for unused symbols...")
     let unusedSymbols = index.findUnusedSymbols(in: allSymbols)
     log("Analysis complete.")
-    
+
     // 4. Report results
     report(unusedSymbols)
   }
@@ -53,12 +60,12 @@ struct DeadCodeFinder: ParsableCommand {
   /// Resolves a path to an absolute path, handling both relative paths and tilde expansion
   private func resolveAbsolutePath(_ path: String) -> String {
     let expandedPath = (path as NSString).expandingTildeInPath
-    
+
     // If the path is already absolute, return it
     if expandedPath.hasPrefix("/") {
       return expandedPath
     }
-    
+
     // If it's relative, make it absolute by prepending current working directory
     let currentWorkingDirectory = FileManager.default.currentDirectoryPath
     return (currentWorkingDirectory as NSString).appendingPathComponent(expandedPath)
