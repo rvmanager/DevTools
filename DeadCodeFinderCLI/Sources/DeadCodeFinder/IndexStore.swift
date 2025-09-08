@@ -1,0 +1,217 @@
+// Sources/DeadCodeFinder/IndexStore.swift
+
+import Foundation
+import IndexStoreDB
+
+class IndexStore {
+    private let store: IndexStoreDB
+    private let projectPath: String
+
+    // A hardcoded path to the libIndexStore.dylib that ships with Xcode.
+    private static let libIndexStorePath = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libIndexStore.dylib"
+
+    init(storePath: String, projectPath: String) throws {
+        // Validate the index store path exists and is a directory
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: storePath, isDirectory: &isDirectory),
+            isDirectory.boolValue else {
+            throw NSError(domain: "DeadCodeFinder", code: 1, 
+                        userInfo: [NSLocalizedDescriptionKey: "Index store path does not exist or is not a directory: \(storePath)"])
+        }
+        
+        let lib = try IndexStoreLibrary(dylibPath: Self.libIndexStorePath)
+        
+        let dbPath = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("deadcodefinder_index_\(UUID().uuidString)")
+            .path
+        
+        print("[DEBUG] Using database path: \(dbPath)")
+        print("[DEBUG] Index store path: \(storePath)")
+        
+        do {
+            self.store = try IndexStoreDB(
+                storePath: storePath,
+                databasePath: dbPath,
+                library: lib,
+                listenToUnitEvents: false
+            )
+            self.projectPath = projectPath
+            print("[INFO] IndexStoreDB opened successfully.")
+        } catch {
+            print("[ERROR] Failed to initialize IndexStoreDB: \(error)")
+            // Clean up the database path if it was created
+            try? FileManager.default.removeItem(atPath: dbPath)
+            throw error
+        }
+    }
+
+    /// Finds all Swift files in the project directory
+    private func findSwiftFiles(in projectPath: String) -> [String] {
+        var swiftFiles: [String] = []
+        
+        guard let enumerator = FileManager.default.enumerator(atPath: projectPath) else {
+            print("[ERROR] Could not create file enumerator for path: \(projectPath)")
+            return swiftFiles
+        }
+        
+        print("[DEBUG] Discovering Swift files in: \(projectPath)")
+        
+        while let relativePath = enumerator.nextObject() as? String {
+            if relativePath.hasSuffix(".swift") {
+                let absolutePath = (projectPath as NSString).appendingPathComponent(relativePath)
+                swiftFiles.append(absolutePath)
+            }
+        }
+        
+        print("[DEBUG] Found \(swiftFiles.count) Swift files")
+        return swiftFiles
+    }
+
+    /// Finds all symbol definitions within the specified project path using file-by-file processing
+    func findAllSymbolDefinitions() -> [SymbolDefinition] {
+        var symbols = [SymbolDefinition]()
+        var totalProcessedCount = 0
+        var totalSkippedCount = 0
+
+        // Conservative LMDB limits to prevent crashes
+        let maxUSRLength = 200      // Much more conservative
+        let maxNameLength = 50      // Very conservative  
+        let maxPathLength = 500     // Conservative
+        let maxKindLength = 30      // Conservative
+
+        print("[DEBUG] Starting file-by-file symbol discovery...")
+        print("[DEBUG] Using conservative limits - USR: \(maxUSRLength), Name: \(maxNameLength), Path: \(maxPathLength), Kind: \(maxKindLength)")
+        
+        // Get all Swift files in the project
+        let swiftFiles = findSwiftFiles(in: projectPath)
+        
+        for (fileIndex, filePath) in swiftFiles.enumerated() {
+            print("[DEBUG] Processing file \(fileIndex + 1)/\(swiftFiles.count): \(URL(fileURLWithPath: filePath).lastPathComponent)")
+            
+            var fileProcessedCount = 0
+            var fileSkippedCount = 0
+            
+            // Get symbol occurrences for this specific file
+            let fileOccurrences = store.symbolOccurrences(inFilePath: filePath)
+            
+            for occurrence in fileOccurrences {
+                defer { 
+                    totalProcessedCount += 1
+                    fileProcessedCount += 1
+                }
+                
+                // We only care about definitions
+                guard occurrence.roles.contains(.definition) else { continue }
+                
+                // Exclude noisy symbols like accessors
+                guard !occurrence.roles.contains(.accessorOf) else { continue }
+                
+                // Get location path
+                let locationPath = occurrence.location.path
+                
+                // Double-check this symbol is within our project (should be, since we're processing by file)
+                guard locationPath.starts(with: projectPath) else { continue }
+
+                // Get symbol properties with conservative validation
+                let usr = occurrence.symbol.usr
+                let name = occurrence.symbol.name
+                let kindString = String(describing: occurrence.symbol.kind)
+                
+                // Conservative validation to prevent LMDB issues
+                var skipReason: String? = nil
+                
+                if usr.isEmpty {
+                    skipReason = "Empty USR"
+                } else if usr.count > maxUSRLength {
+                    skipReason = "USR too long (\(usr.count) > \(maxUSRLength))"
+                } else if name.isEmpty {
+                    skipReason = "Empty name"
+                } else if name.count > maxNameLength {
+                    skipReason = "Name too long (\(name.count) > \(maxNameLength))"
+                } else if kindString.count > maxKindLength {
+                    skipReason = "Kind too long (\(kindString.count) > \(maxKindLength))"
+                } else if locationPath.count > maxPathLength {
+                    skipReason = "Path too long (\(locationPath.count) > \(maxPathLength))"
+                }
+                
+                if let reason = skipReason {
+                    totalSkippedCount += 1
+                    fileSkippedCount += 1
+                    if totalSkippedCount <= 10 { // Show details for first few across all files
+                        print("[WARNING] Skipping symbol '\(name.prefix(20))...' - \(reason)")
+                    }
+                    continue
+                }
+                
+                // Get location properties
+                let line = occurrence.location.line
+                let column = occurrence.location.utf8Column
+                
+                guard line >= 0, column >= 0 else {
+                    totalSkippedCount += 1
+                    fileSkippedCount += 1
+                    if totalSkippedCount <= 10 {
+                        print("[WARNING] Invalid location - line: \(line), column: \(column)")
+                    }
+                    continue
+                }
+
+                let definition = SymbolDefinition(
+                    usr: usr,
+                    name: name,
+                    kind: kindString,
+                    location: SourceLocation(
+                        filePath: locationPath,
+                        line: line,
+                        column: column
+                    )
+                )
+                symbols.append(definition)
+            }
+            
+            print("[DEBUG] File \(fileIndex + 1) completed: \(fileProcessedCount) processed, \(fileSkippedCount) skipped, \(symbols.count) total symbols so far")
+        }
+        
+        print("[DEBUG] File-by-file discovery completed.")
+        print("[DEBUG] Total processed: \(totalProcessedCount), Valid symbols: \(symbols.count), Total skipped: \(totalSkippedCount)")
+        return symbols
+    }
+
+    /// Takes a list of symbols and returns the subset that have no references
+    func findUnusedSymbols(in allSymbols: [SymbolDefinition]) -> [SymbolDefinition] {
+        var unusedSymbols = [SymbolDefinition]()
+        var processedSymbols = 0
+
+        print("[DEBUG] Analyzing \(allSymbols.count) symbols for usage...")
+
+        for symbol in allSymbols {
+            defer { 
+                processedSymbols += 1
+                if processedSymbols % 50 == 0 {
+                    print("[DEBUG] Analyzed \(processedSymbols)/\(allSymbols.count) symbols...")
+                }
+            }
+            
+            // Validate USR before querying (should already be validated, but double-check)
+            guard !symbol.usr.isEmpty, symbol.usr.count <= 200 else {
+                print("[WARNING] Skipping symbol '\(symbol.name)' with invalid USR in usage check (length: \(symbol.usr.count))")
+                continue
+            }
+            
+            // Check for references
+            let occurrences = store.occurrences(ofUSR: symbol.usr, roles: .reference)
+            
+            if occurrences.isEmpty {
+                // Check for overrides as well
+                let overrideOccurrences = store.occurrences(ofUSR: symbol.usr, roles: .overrideOf)
+                
+                if overrideOccurrences.isEmpty {
+                    unusedSymbols.append(symbol)
+                }
+            }
+        }
+        
+        print("[DEBUG] Found \(unusedSymbols.count) potentially unused symbols")
+        return unusedSymbols
+    }
+}
