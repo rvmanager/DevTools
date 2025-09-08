@@ -60,13 +60,6 @@ struct DeadCodeFinder: ParsableCommand {
         log("Found \(analysisResult.definitions.count) definitions (structs, classes, functions, etc.).")
         log("Identified \(analysisResult.entryPoints.count) potential entry points from syntax.")
         
-        if verbose {
-            log("Detailed Entry Points Report (from syntax):")
-            for entryPoint in analysisResult.entryPoints {
-                log("  - [SYNTAX ENTRY POINT] \(entryPoint.name) at \(entryPoint.location.description)")
-            }
-        }
-        
         // --- STAGE 2: SYMBOL HYDRATION (IndexStoreDB) ---
         log("--- STAGE 2: Hydrating Symbols with USRs ---")
         log("Connecting to Index Store...")
@@ -81,18 +74,37 @@ struct DeadCodeFinder: ParsableCommand {
         for var definition in analysisResult.definitions {
             let filePath = definition.location.filePath
             
-            // Cache occurrences per file to avoid repeated lookups
             if fileOccurrencesCache[filePath] == nil {
                 log("Caching symbols for file: \(filePath)")
                 fileOccurrencesCache[filePath] = index.store.symbolOccurrences(inFilePath: filePath)
             }
             
             guard let occurrencesInFile = fileOccurrencesCache[filePath] else { continue }
+
+            // --- VVV NEW DIAGNOSTIC LOGGING VVV ---
+            if verbose {
+                print("\n[DEBUG] ----------------------------------------------------")
+                print("[DEBUG] Attempting to match definition:")
+                print("[DEBUG]   - Name: \(definition.name)")
+                print("[DEBUG]   - SwiftSyntax Location: line=\(definition.location.line), utf8Column=\(definition.location.utf8Column)")
+                
+                let potentialMatches = occurrencesInFile.filter { $0.location.line == definition.location.line && $0.roles.contains(.definition) }
+                
+                if potentialMatches.isEmpty {
+                    print("[DEBUG]   - IndexStoreDB: No definitions found on line \(definition.location.line).")
+                } else {
+                    print("[DEBUG]   - IndexStoreDB Definitions on line \(definition.location.line):")
+                    for occ in potentialMatches {
+                        print("[DEBUG]     - Symbol: \(occ.symbol.name), Kind: \(occ.symbol.kind), Location: line=\(occ.location.line), utf8Column=\(occ.location.utf8Column)")
+                    }
+                }
+                 print("[DEBUG] ----------------------------------------------------")
+            }
+            // --- ^^^ END DIAGNOSTIC LOGGING ^^^ ---
             
-            // Find the symbol occurrence that matches our definition's location
             let match = occurrencesInFile.first { occ in
                 return occ.location.line == definition.location.line
-                    && occ.location.utf8Column == definition.location.column
+                    && occ.location.utf8Column == definition.location.utf8Column
                     && occ.roles.contains(.definition)
             }
 
@@ -141,10 +153,10 @@ struct DeadCodeFinder: ParsableCommand {
     }
 
     private func log(_ message: String) {
-        // Always print high-level info, use verbose for detailed steps
         if message.starts(with: "---") || message.starts(with: "🚀") || !verbose {
              print("[INFO] \(message)")
         } else if verbose {
+             // For regular verbose, change to DEBUG, our new logs will use this too
              print("[DEBUG] \(message)")
         }
     }

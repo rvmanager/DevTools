@@ -96,8 +96,6 @@ private class FunctionVisitor: SyntaxVisitor {
     super.init(viewMode: .sourceAccurate)
   }
     
-  // ... (rest of the file is unchanged but shown for completeness)
-    
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
       let name = node.name.text
       let fullName = createUniqueName(functionName: name, node: node)
@@ -342,7 +340,6 @@ private class FunctionVisitor: SyntaxVisitor {
   // MARK: - Helpers
 
   private func log(_ message: String) {
-      // This logging is nested, so it's always controlled by the SyntaxAnalyzer's verbose flag
       if verbose {
            print("[VISITOR] \(message)")
       }
@@ -362,7 +359,6 @@ private class FunctionVisitor: SyntaxVisitor {
         context = typeNode.name.text + "." + context
       } else if let typeNode = parent.as(ExtensionDeclSyntax.self) {
           context = typeNode.extendedType.trimmedDescription + "." + context
-          // Don't continue past an extension, as it defines the full context
           break
       }
       current = parent
@@ -466,12 +462,24 @@ private class FunctionVisitor: SyntaxVisitor {
   private func sourceLocation(for node: SyntaxProtocol) -> SourceLocation {
     let converter = SourceLocationConverter(
       fileName: fileURL.path, tree: node.root.as(SourceFileSyntax.self)!)
-    let start = node.startLocation(converter: converter)
+      
+    let startPosition = node.positionAfterSkippingLeadingTrivia
+    let start = converter.location(for: startPosition)
     let end = node.endLocation(converter: converter)
+
+    // FIXED: Calculate the UTF-8 column manually
+    // 1. Get the absolute UTF-8 offset of the start of the line
+    let lineStartPosition = converter.position(ofLine: start.line, column: 1)
+
+    // 2. The symbol's offset is start.offset. Subtract the line's start offset.
+    // The difference is the 0-based column. Add 1 to make it 1-based.
+    let utf8Column = start.offset - lineStartPosition.utf8Offset + 1
+    
     return SourceLocation(
         filePath: fileURL.path,
         line: start.line,
         column: start.column,
+        utf8Column: utf8Column, // <-- Use the correctly calculated value
         endLine: end.line,
         endColumn: end.column
     )

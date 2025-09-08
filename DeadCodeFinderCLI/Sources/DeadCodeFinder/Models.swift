@@ -41,6 +41,7 @@ struct SourceLocation {
   let filePath: String
   let line: Int
   let column: Int
+  let utf8Column: Int // <-- FIXED: Added property to store the UTF-8 byte offset column
   let endLine: Int
   let endColumn: Int
 

@@ -14,13 +14,11 @@ class IndexStore {
 
     init(storePath: String, verbose: Bool = false) throws {
         self.verbose = verbose
-//        self.log("Initializing IndexStore...")
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: storePath, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw NSError(domain: "DeadCodeFinder", code: 1, userInfo: [NSLocalizedDescriptionKey: "Index store path does not exist or is not a directory: \(storePath)"])
         }
 
-//        self.log("Loading dylib from: \(Self.libIndexStorePath)")
         let lib = try IndexStoreLibrary(dylibPath: Self.libIndexStorePath)
 
         // Create a temporary path for the index database.
@@ -28,8 +26,6 @@ class IndexStore {
             .appendingPathComponent("deadcodefinder_index_\(UUID().uuidString)")
             .path
         
-//        self.log("Using temporary DB path: \(dbPath)")
-
         do {
             self.store = try IndexStoreDB(
                 storePath: storePath,
@@ -37,7 +33,14 @@ class IndexStore {
                 library: lib,
                 listenToUnitEvents: false
             )
-            self.log("IndexStoreDB opened successfully.")
+            
+            // --- THIS IS THE FIX ---
+            // Explicitly wait for the index store to process any new unit files.
+            // Without this, the database will be empty and all queries will fail.
+            self.store.pollForUnitChangesAndWait()
+            // -----------------------
+
+            self.log("IndexStoreDB opened and synchronized successfully.")
         } catch {
             print("[ERROR] Failed to initialize IndexStoreDB: \(error)")
             try? FileManager.default.removeItem(atPath: dbPath)
