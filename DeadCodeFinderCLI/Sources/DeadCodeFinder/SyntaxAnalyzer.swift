@@ -99,7 +99,8 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
       let name = node.name.text
       let fullName = createUniqueName(functionName: name, node: node)
-      let location = sourceLocation(for: node)
+      // FIXED: Get location of the name token, not the whole node.
+      let location = sourceLocation(for: node.name)
       
       var isEntryPoint = false
       if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
@@ -135,7 +136,8 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
       let name = node.name.text
       let fullName = createUniqueName(functionName: name, node: node)
-      let location = sourceLocation(for: node)
+      // FIXED: Get location of the name token, not the whole node.
+      let location = sourceLocation(for: node.name)
       
       var isEntryPoint = false
       if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
@@ -167,7 +169,8 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
       let name = node.name.text
       let fullName = createUniqueName(functionName: name, node: node)
-      let location = sourceLocation(for: node)
+      // FIXED: Get location of the name token, not the whole node.
+      let location = sourceLocation(for: node.name)
       
       let definition = SourceDefinition(
           name: fullName,
@@ -185,15 +188,19 @@ private class FunctionVisitor: SyntaxVisitor {
   }
 
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-    guard let binding = node.bindings.first, binding.accessorBlock != nil else {
-      return .visitChildren
-    }
-    guard let varName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text else {
-      return .visitChildren
+    guard let binding = node.bindings.first, let pattern = binding.pattern.as(IdentifierPatternSyntax.self) else {
+        return .visitChildren
     }
 
+    // Only consider computed properties with explicit get/set blocks
+    guard binding.accessorBlock != nil else {
+        return .visitChildren
+    }
+
+    let varName = pattern.identifier.text
     let fullName = createUniqueName(functionName: varName, node: node)
-    let location = sourceLocation(for: node)
+    // FIXED: Get location of the pattern (the variable name), not the whole node.
+    let location = sourceLocation(for: pattern)
 
     var isEntryPoint = false
     if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
@@ -227,7 +234,8 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
     let funcName = node.name.text
     let fullName = createUniqueName(functionName: funcName, node: node)
-    let location = sourceLocation(for: node)
+    // FIXED: Get location of the name token, not the whole node.
+    let location = sourceLocation(for: node.name)
 
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isModelMethod = isEnclosedInModel(node: node)
@@ -262,7 +270,8 @@ private class FunctionVisitor: SyntaxVisitor {
 
   override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
     let fullName = createUniqueName(functionName: "init", node: node)
-    let location = sourceLocation(for: node)
+    // FIXED: Get location of the 'init' keyword.
+    let location = sourceLocation(for: node.initKeyword)
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isPublic = node.modifiers.contains { $0.name.text == "public" }
     let isModelMethod = isEnclosedInModel(node: node)
@@ -467,19 +476,15 @@ private class FunctionVisitor: SyntaxVisitor {
     let start = converter.location(for: startPosition)
     let end = node.endLocation(converter: converter)
 
-    // FIXED: Calculate the UTF-8 column manually
-    // 1. Get the absolute UTF-8 offset of the start of the line
     let lineStartPosition = converter.position(ofLine: start.line, column: 1)
-
-    // 2. The symbol's offset is start.offset. Subtract the line's start offset.
-    // The difference is the 0-based column. Add 1 to make it 1-based.
+    
     let utf8Column = start.offset - lineStartPosition.utf8Offset + 1
     
     return SourceLocation(
         filePath: fileURL.path,
         line: start.line,
         column: start.column,
-        utf8Column: utf8Column, // <-- Use the correctly calculated value
+        utf8Column: utf8Column,
         endLine: end.line,
         endColumn: end.column
     )

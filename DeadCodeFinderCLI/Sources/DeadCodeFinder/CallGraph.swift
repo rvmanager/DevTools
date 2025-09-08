@@ -13,48 +13,53 @@ class CallGraph {
 
     init(definitions: [SourceDefinition], index: IndexStore, verbose: Bool) {
         self.definitions = definitions
-        self.usrToDefinition = Dictionary(uniqueKeysWithValues: definitions.compactMap {
-            guard let usr = $0.usr else { return nil }
-            return (usr, $0)
-        })
+        
+        // --- THIS IS THE FIX ---
+        // The `definitions` array can contain duplicates where different syntax nodes
+        // resolve to the same canonical symbol, resulting in the same USR.
+        // `Dictionary(uniqueKeysWithValues:)` crashes on these duplicate keys.
+        // We now use `Dictionary(_:uniquingKeysWith:)` to handle this gracefully,
+        // keeping the first definition we encounter for any given USR.
+        self.usrToDefinition = Dictionary(definitions.compactMap { def -> (String, SourceDefinition)? in
+            guard let usr = def.usr else { return nil }
+            return (usr, def)
+        }, uniquingKeysWith: { (first, _) in first })
+        // --- END FIX ---
+
         self.verbose = verbose
         buildGraph(index: index.store)
     }
 
     private func buildGraph(index: IndexStoreDB) {
-        log("Building accurate call graph from \(definitions.count) definitions...")
+        log("Building accurate call graph from \(usrToDefinition.count) unique definitions...")
 
         var fileRangeToUsrMap: [String: [(Range<Int>, String)]] = [:]
-        for definition in definitions where definition.usr != nil {
+        // Use the now-unique usrToDefinition dictionary as the source of truth
+        for (usr, definition) in usrToDefinition {
             let range = definition.location.line ..< definition.location.endLine + 1
-            fileRangeToUsrMap[definition.location.filePath, default: []].append((range, definition.usr!))
+            fileRangeToUsrMap[definition.location.filePath, default: []].append((range, usr))
         }
 
-        // Sort ranges to allow for efficient lookup later
         for (filePath, ranges) in fileRangeToUsrMap {
             fileRangeToUsrMap[filePath] = ranges.sorted { $0.0.lowerBound < $1.0.lowerBound }
         }
         
         log("Processing definitions to find references...")
         var count = 0
-        for calleeDef in definitions {
+        // Iterate over the unique dictionary
+        for (calleeUsr, calleeDef) in usrToDefinition {
             count += 1
             if verbose && count % 100 == 0 {
-                log("...processed \(count)/\(definitions.count) definitions for references")
+                log("...processed \(count)/\(usrToDefinition.count) definitions for references")
             }
-            guard let calleeUsr = calleeDef.usr else { continue }
 
-            // Find all places where this symbol is referenced.
             let references = index.occurrences(ofUSR: calleeUsr, roles: .reference)
 
             for reference in references {
                 guard let rangesInFile = fileRangeToUsrMap[reference.location.path] else {
-                    // This can happen if the reference is in a file we are not analyzing (e.g., system frameworks)
                     continue
                 }
 
-                // Find which definition contains this reference's location.
-                // We search backwards because definitions can be nested.
                 var containingUsr: String?
                 for (range, usr) in rangesInFile.reversed() {
                     if range.contains(reference.location.line) {
@@ -68,7 +73,6 @@ class CallGraph {
                     continue
                 }
 
-                // A function calling itself is not an edge we need to track for reachability from an entry point.
                 if callerUsr == calleeUsr {
                     continue
                 }
@@ -85,7 +89,7 @@ class CallGraph {
         }
 
         let edgeCount = adjacencyList.values.reduce(0) { $0 + $1.count }
-        log("Accurate call graph built with \(definitions.count) nodes and \(edgeCount) edges.")
+        log("Accurate call graph built with \(usrToDefinition.count) nodes and \(edgeCount) edges.")
     }
     
     private func log(_ message: String) {
