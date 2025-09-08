@@ -1,8 +1,8 @@
 // DeadCodeFinder/SyntaxAnalyzer.swift
 
 import Foundation
-import SwiftSyntax
 import SwiftParser
+import SwiftSyntax
 
 struct AnalysisResult {
   let definitions: [FunctionDefinition]
@@ -57,52 +57,54 @@ private class FunctionVisitor: SyntaxVisitor {
 
   // MARK: - Identify Function & Property Definitions
 
-  // This is the CORRECT override for handling variable declarations.
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-      // We only care about computed properties, which have an accessor block.
-      guard let binding = node.bindings.first, binding.accessorBlock != nil else {
-          return .visitChildren
-      }
-      guard let varName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text else {
-          return .visitChildren
-      }
-
-      let fullName = createUniqueName(functionName: varName, node: node)
-      let location = sourceLocation(for: node)
-
-      // Check if it's a SwiftUI body entry point
-      var isEntryPoint = false
-      if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
-          if parentStruct.inheritanceClause?.inheritedTypes.contains(where: { $0.type.description.contains("View") }) == true {
-              isEntryPoint = true
-          }
-      }
-
-      let definition = FunctionDefinition(id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
-      definitions.append(definition)
-      functionContextStack.append(fullName)
-
+    guard let binding = node.bindings.first, binding.accessorBlock != nil else {
       return .visitChildren
-  }
-    
-  // This is the CORRECT corresponding post-visit method.
-  override func visitPost(_ node: VariableDeclSyntax) {
-      // Pop context if it was a computed property
-      if let binding = node.bindings.first, binding.accessorBlock != nil {
-          _ = functionContextStack.popLast()
+    }
+    guard let varName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text else {
+      return .visitChildren
+    }
+
+    let fullName = createUniqueName(functionName: varName, node: node)
+    let location = sourceLocation(for: node)
+
+    var isEntryPoint = false
+    if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
+      if parentStruct.inheritanceClause?.inheritedTypes.contains(where: {
+        $0.type.description.contains("View")
+      }) == true {
+        isEntryPoint = true
       }
+    }
+
+    let definition = FunctionDefinition(
+      id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
+    definitions.append(definition)
+    functionContextStack.append(fullName)
+
+    return .visitChildren
+  }
+
+  override func visitPost(_ node: VariableDeclSyntax) {
+    if let binding = node.bindings.first, binding.accessorBlock != nil {
+      _ = functionContextStack.popLast()
+    }
   }
 
   override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
     let funcName = node.name.text
     let fullName = createUniqueName(functionName: funcName, node: node)
     let location = sourceLocation(for: node)
-    
+
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isModelMethod = isEnclosedInModel(node: node)
-    let isPrivate = node.modifiers.contains { $0.name.text == "private" || $0.name.text == "fileprivate" }
+    let isPrivate = node.modifiers.contains {
+      $0.name.text == "private" || $0.name.text == "fileprivate"
+    }
     let isNonPrivateClassMethod = isEnclosedInClass(node: node) && !isPrivate
-    let isEntryPoint = isOverridden || isModelMethod || isNonPrivateClassMethod || checkForEntryPoint(node: node, name: funcName)
+    let isEntryPoint =
+      isOverridden || isModelMethod || isNonPrivateClassMethod
+      || checkForEntryPoint(node: node, name: funcName)
 
     let definition = FunctionDefinition(
       id: UUID(), name: fullName, location: location, isEntryPoint: isEntryPoint)
@@ -121,7 +123,9 @@ private class FunctionVisitor: SyntaxVisitor {
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isPublic = node.modifiers.contains { $0.name.text == "public" }
     let isModelMethod = isEnclosedInModel(node: node)
-    let isPrivate = node.modifiers.contains { $0.name.text == "private" || $0.name.text == "fileprivate" }
+    let isPrivate = node.modifiers.contains {
+      $0.name.text == "private" || $0.name.text == "fileprivate"
+    }
     let isNonPrivateClassMethod = isEnclosedInClass(node: node) && !isPrivate
     let isEntryPoint = isOverridden || isPublic || isModelMethod || isNonPrivateClassMethod
 
@@ -159,6 +163,35 @@ private class FunctionVisitor: SyntaxVisitor {
     return .visitChildren
   }
 
+  // *** THE IMPROVEMENT: This new method detects computed property access ***
+  override func visit(_ node: DeclReferenceExprSyntax) -> SyntaxVisitorContinueKind {
+    // Ensure we are inside a function or another computed property.
+    guard let callerName = functionContextStack.last else {
+      return .visitChildren
+    }
+
+    let calleeName = node.baseName.text
+
+    // A simple heuristic to filter out references to types (e.g., String, Int)
+    // or enum cases, which typically start with an uppercase letter.
+    guard let firstChar = calleeName.first, firstChar.isLowercase else {
+      return .visitChildren
+    }
+
+    // Avoid creating a "call" from a function to itself when it's just a reference,
+    // not an actual recursive call (which would be a FunctionCallExprSyntax).
+    let callerShortName = String(callerName.split(separator: ".").last ?? "")
+    if callerShortName == calleeName {
+      return .visitChildren
+    }
+
+    let location = sourceLocation(for: node)
+    let call = FunctionCall(callerName: callerName, calleeName: calleeName, location: location)
+    calls.append(call)
+
+    return .visitChildren
+  }
+
   // MARK: - Helpers
 
   private func createUniqueName(functionName: String, node: SyntaxProtocol) -> String {
@@ -189,44 +222,47 @@ private class FunctionVisitor: SyntaxVisitor {
     }
     return nil
   }
-    
+
   private func isEnclosedInModel(node: SyntaxProtocol) -> Bool {
-      var current: Syntax? = node._syntaxNode
-      while let parent = current?.parent {
-          if let classDecl = parent.as(ClassDeclSyntax.self) {
-              if classDecl.attributes.contains(where: { isModelMacro($0) }) {
-                  return true
-              }
-          }
-          if parent.is(SourceFileSyntax.self) { break }
-          current = parent
+    var current: Syntax? = node._syntaxNode
+    while let parent = current?.parent {
+      if let classDecl = parent.as(ClassDeclSyntax.self) {
+        if classDecl.attributes.contains(where: { isModelMacro($0) }) {
+          return true
+        }
       }
-      return false
+      if parent.is(SourceFileSyntax.self) { break }
+      current = parent
+    }
+    return false
   }
 
   private func isEnclosedInClass(node: SyntaxProtocol) -> Bool {
-      var current: Syntax? = node._syntaxNode
-      while let parent = current?.parent {
-          if parent.is(ClassDeclSyntax.self) { return true }
-          if parent.is(SourceFileSyntax.self) { break }
-          current = parent
-      }
-      return false
+    var current: Syntax? = node._syntaxNode
+    while let parent = current?.parent {
+      if parent.is(ClassDeclSyntax.self) { return true }
+      if parent.is(SourceFileSyntax.self) { break }
+      current = parent
+    }
+    return false
   }
-    
+
   private func isModelMacro(_ attr: AttributeListSyntax.Element) -> Bool {
-      if let attribute = attr.as(AttributeSyntax.self),
-         let identifier = attribute.attributeName.as(IdentifierTypeSyntax.self) {
-          return identifier.name.text == "Model"
-      }
-      return false
+    if let attribute = attr.as(AttributeSyntax.self),
+      let identifier = attribute.attributeName.as(IdentifierTypeSyntax.self)
+    {
+      return identifier.name.text == "Model"
+    }
+    return false
   }
 
   private func checkForEntryPoint(node: FunctionDeclSyntax, name: String) -> Bool {
     if name == "main", let parent = node.parent?.parent?.parent,
       let decl = parent.asProtocol(WithAttributesSyntax.self)
     {
-      if decl.attributes.contains(where: { $0.as(AttributeSyntax.self)?.attributeName.description == "main" }) {
+      if decl.attributes.contains(where: {
+        $0.as(AttributeSyntax.self)?.attributeName.description == "main"
+      }) {
         return true
       }
     }
@@ -251,7 +287,9 @@ private class FunctionVisitor: SyntaxVisitor {
       return true
     }
     if name == "body", let parent = node.parent?.parent?.parent?.as(StructDeclSyntax.self) {
-      if parent.inheritanceClause?.inheritedTypes.contains(where: { $0.type.description.contains("View") }) == true {
+      if parent.inheritanceClause?.inheritedTypes.contains(where: {
+        $0.type.description.contains("View")
+      }) == true {
         return true
       }
     }
@@ -262,7 +300,8 @@ private class FunctionVisitor: SyntaxVisitor {
   }
 
   private func sourceLocation(for node: SyntaxProtocol) -> SourceLocation {
-    let converter = SourceLocationConverter(fileName: fileURL.path, tree: node.root.as(SourceFileSyntax.self)!)
+    let converter = SourceLocationConverter(
+      fileName: fileURL.path, tree: node.root.as(SourceFileSyntax.self)!)
     let location = node.startLocation(converter: converter)
     return SourceLocation(
       filePath: fileURL.path, line: location.line, column: location.column)

@@ -20,3 +20,10 @@ struct FunctionCall {
   let calleeName: String
   let location: SourceLocation
 }
+
+// NEW: A model to hold the calculated hierarchy details for each function.
+struct CallHierarchyInfo {
+  let function: FunctionDefinition
+  let highestCaller: FunctionDefinition?
+  let level: Int
+}

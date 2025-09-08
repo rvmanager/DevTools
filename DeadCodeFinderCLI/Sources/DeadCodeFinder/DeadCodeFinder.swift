@@ -19,7 +19,7 @@ struct DeadCodeFinder: ParsableCommand {
   @Flag(name: .shortAndLong, help: "Enable verbose logging for detailed analysis steps.")
   private var verbose: Bool = false
 
-func run() throws {
+  func run() throws {
     let absolutePath = (projectPath as NSString).expandingTildeInPath
 
     log("Starting analysis of project at: \(absolutePath)")
@@ -30,8 +30,7 @@ func run() throws {
 
     // 1. Find all Swift files
     var swiftFiles = ProjectParser.findSwiftFiles(at: absolutePath, excluding: excludedDirs)
-    
-    // *** THE FIX: Exclude the package manifest from analysis ***
+
     swiftFiles.removeAll { $0.lastPathComponent == "Package.swift" }
 
     log("Found \(swiftFiles.count) Swift files to analyze.")
@@ -52,26 +51,37 @@ func run() throws {
       verbose: verbose
     )
 
-    // 4. Detect dead code
-    let detector = DeadCodeDetector(graph: callGraph, verbose: verbose)
-    let deadFunctions = detector.findDeadCode()
+    // 4. MODIFIED: Calculate call hierarchy for all functions
+    log("Calculating call hierarchy for all functions...")
+    let callHierarchy = callGraph.calculateCallHierarchy()
+    log("Calculation complete.")
 
     // 5. Report results
-    report(deadFunctions)
+    report(callHierarchy)
   }
 
-  private func report(_ deadFunctions: [FunctionDefinition]) {
-    if deadFunctions.isEmpty {
-      print("\n✅ No dead functions found. Excellent!")
-    } else {
-      print("\n❌ Found \(deadFunctions.count) potentially dead functions:")
-      let sortedFunctions = deadFunctions.sorted {
-        $0.location.filePath < $1.location.filePath
-          || ($0.location.filePath == $1.location.filePath && $0.location.line < $1.location.line)
+  // MODIFIED: This function is completely rewritten for the new output format.
+  private func report(_ callHierarchy: [CallHierarchyInfo]) {
+    // Sort the results by call level, lowest first.
+    let sortedHierarchy = callHierarchy.sorted {
+      if $0.level != $1.level {
+        return $0.level < $1.level
       }
-      for function in sortedFunctions {
-        print("  - \(function.location.filePath):\(function.location.line) -> \(function.name)")
+      if $0.function.location.filePath != $1.function.location.filePath {
+        return $0.function.location.filePath < $1.function.location.filePath
       }
+      return $0.function.location.line < $1.function.location.line
+    }
+
+    print("\n--- Function Call Hierarchy Report ---")
+    for info in sortedHierarchy {
+      let location = "\(info.function.location.filePath):\(info.function.location.line)"
+      let funcName = info.function.name
+      let highestCallerName = info.highestCaller?.name ?? "<none>"
+      let level = info.level
+
+      // Print in the requested tab-separated format.
+      print("\(location)\t\(funcName)\t\(highestCallerName)\t\(level)")
     }
   }
 
