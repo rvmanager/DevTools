@@ -1,5 +1,5 @@
 {
-  "originHash" : "558b9df07c7b03c4b14c5081c7d2050d277d59bd652b993302967d730ad5e655",
+  "originHash" : "7396198d69053ac2ad19da67239fc44f99aad4d355a3fbca14cf997f6d9d7478",
   "pins" : [
     {
       "identity" : "indexstore-db",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "309a47b2b1d9b5e991f36961c983ecec72275be3",
         "version" : "1.6.1"
+      }
+    },
+    {
+      "identity" : "swift-syntax",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-syntax.git",
+      "state" : {
+        "revision" : "0687f71944021d616d34d922343dcef086855920",
+        "version" : "600.0.1"
       }
     }
   ],
