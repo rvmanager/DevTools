@@ -49,25 +49,17 @@ struct DeadCodeFinder: ParsableCommand {
         
         log("Hydrating \(analysisResult.definitions.count) definitions with USRs...")
         var hydratedDefinitions = [SourceDefinition]()
-        
-        // Create a cache for file occurrences to avoid redundant lookups
         var fileOccurrencesCache: [String: [SymbolOccurrence]] = [:]
 
         for var definition in analysisResult.definitions {
             let filePath = definition.location.filePath
             
-            // Populate the cache if this is the first time we see this file
             if fileOccurrencesCache[filePath] == nil {
                 fileOccurrencesCache[filePath] = index.store.symbolOccurrences(inFilePath: filePath)
             }
             
-            guard let occurrencesInFile = fileOccurrencesCache[filePath] else {
-                if verbose { log("Warning: Could not get any occurrences for file \(filePath)") }
-                continue
-            }
+            guard let occurrencesInFile = fileOccurrencesCache[filePath] else { continue }
             
-            // Now, find the specific occurrence that matches our definition's location.
-            // Note: IndexStoreDB columns are 1-based and are UTF-8 offsets. SwiftSyntax is also 1-based.
             let match = occurrencesInFile.first { occ in
                 return occ.location.line == definition.location.line
                     && occ.location.utf8Column == definition.location.column
@@ -83,40 +75,25 @@ struct DeadCodeFinder: ParsableCommand {
         }
         log("Successfully hydrated \(hydratedDefinitions.count) definitions.")
         
-        // --- STAGE 3 & 4 (Sprint 1 Version): Unused Type Analysis ---
-        log("Analyzing for unused types (structs, classes, enums)...")
-        var unusedTypes = [SourceDefinition]()
+        // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
+        log("Building accurate call graph...")
+        let callGraph = CallGraph(definitions: hydratedDefinitions, index: index, verbose: verbose)
         
-        let typeDefinitions = hydratedDefinitions.filter {
-            $0.kind == .class || $0.kind == .struct || $0.kind == .enum
-        }
-        
-        for definition in typeDefinitions {
-            guard let usr = definition.usr else { continue }
-            
-            if definition.isEntryPoint {
-                if verbose { log("Skipping analysis for entry point: \(definition.name)")}
-                continue
-            }
-
-            // Check for references
-            let references = index.store.occurrences(ofUSR: usr, roles: .reference)
-            
-            if references.isEmpty {
-                unusedTypes.append(definition)
-            }
-        }
+        // --- STAGE 4: REACHABILITY ANALYSIS ---
+        log("Analyzing for unreachable (dead) code...")
+        let detector = DeadCodeDetector(graph: callGraph, verbose: verbose)
+        let deadSymbols = detector.findDeadCode()
         log("Analysis complete.")
 
         // --- REPORTING ---
-        report(unusedTypes)
+        report(deadSymbols)
     }
 
     private func report(_ unusedSymbols: [SourceDefinition]) {
         if unusedSymbols.isEmpty {
-            print("\n✅ No unused types found.")
+            print("\n✅ No unused symbols found. Excellent!")
         } else {
-            print("\n❌ Found \(unusedSymbols.count) potentially unused types:")
+            print("\n❌ Found \(unusedSymbols.count) potentially unused symbols:")
             let sortedSymbols = unusedSymbols.sorted {
                 $0.location.filePath < $1.location.filePath
                     || ($0.location.filePath == $1.location.filePath && $0.location.line < $1.location.line)

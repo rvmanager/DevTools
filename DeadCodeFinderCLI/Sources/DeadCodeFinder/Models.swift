@@ -2,7 +2,7 @@
 
 import Foundation
 
-enum DefinitionKind: String, Sendable {
+enum DefinitionKind: String {
     case `struct`
     case `class`
     case `enum`
@@ -11,33 +11,34 @@ enum DefinitionKind: String, Sendable {
     case variable
 }
 
-struct SourceDefinition: Sendable {
+struct SourceDefinition {
   let id: UUID = UUID()
   let name: String
   let kind: DefinitionKind
   let location: SourceLocation
-  let isEntryPoint: Bool
   var usr: String?
+  var isEntryPoint: Bool
 }
 
-struct FunctionCall: Sendable {
+// NOTE: The following structs are no longer used by the final analysis pipeline.
+struct FunctionCall {
   let callerName: String
   let calleeName: String
   let location: SourceLocation
 }
 
-struct CallHierarchyInfo: Sendable {
-  let function: FunctionDefinition
-  let highestCaller: FunctionDefinition?
+struct CallHierarchyInfo {
+  let function: SourceDefinition // Changed from FunctionDefinition
+  let highestCaller: SourceDefinition? // Changed from FunctionDefinition
   let level: Int
 }
 
-typealias FunctionDefinition = SourceDefinition
-
-struct SourceLocation: Sendable {
+struct SourceLocation {
   let filePath: String
   let line: Int
   let column: Int
+  let endLine: Int
+  let endColumn: Int
 
   var description: String {
     "\(filePath):\(line):\(column)"

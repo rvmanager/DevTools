@@ -4,7 +4,6 @@ import Foundation
 import SwiftParser
 import SwiftSyntax
 
-// SPRINT 1: Updated to use the new SourceDefinition model.
 struct AnalysisResult {
   let definitions: [SourceDefinition]
   let calls: [FunctionCall]
@@ -19,12 +18,10 @@ class SyntaxAnalyzer: @unchecked Sendable {
   }
 
   func analyze(files: [URL]) -> AnalysisResult {
-    // SPRINT 1: Changed to use SourceDefinition
     let definitions = ThreadSafeArray<SourceDefinition>()
     let calls = ThreadSafeArray<FunctionCall>()
     let entryPoints = ThreadSafeArray<SourceDefinition>()
 
-    // Using concurrentPerform for faster parsing
     DispatchQueue.concurrentPerform(iterations: files.count) { index in
         let fileURL = files[index]
         if verbose { print("Parsing \(fileURL.path)...") }
@@ -61,12 +58,6 @@ private class ThreadSafeArray<T: Sendable>: @unchecked Sendable {
         return queue.sync { _items }
     }
     
-    func append(_ item: T) {
-        queue.async(flags: .barrier) {
-            self._items.append(item)
-        }
-    }
-    
     func append(contentsOf items: [T]) {
         queue.async(flags: .barrier) {
             self._items.append(contentsOf: items)
@@ -76,7 +67,6 @@ private class ThreadSafeArray<T: Sendable>: @unchecked Sendable {
 
 private class FunctionVisitor: SyntaxVisitor {
   let fileURL: URL
-  // SPRINT 1: Changed to use SourceDefinition
   private(set) var definitions: [SourceDefinition] = []
   private(set) var calls: [FunctionCall] = []
 
@@ -87,8 +77,6 @@ private class FunctionVisitor: SyntaxVisitor {
     super.init(viewMode: .sourceAccurate)
   }
     
-  // MARK: - SPRINT 1: Identify Type Definitions
-
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
       let name = node.name.text
       let fullName = createUniqueName(functionName: name, node: node)
@@ -155,7 +143,7 @@ private class FunctionVisitor: SyntaxVisitor {
           name: fullName,
           kind: .enum,
           location: location,
-          isEntryPoint: false // Enums are rarely entry points
+          isEntryPoint: false
       )
       definitions.append(definition)
       functionContextStack.append(fullName)
@@ -165,8 +153,6 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visitPost(_ node: EnumDeclSyntax) {
       _ = functionContextStack.popLast()
   }
-
-  // MARK: - Identify Function & Property Definitions
 
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
     guard let binding = node.bindings.first, binding.accessorBlock != nil else {
@@ -254,8 +240,6 @@ private class FunctionVisitor: SyntaxVisitor {
     _ = functionContextStack.popLast()
   }
 
-  // MARK: - Identify Function Calls
-
   override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
     guard let callerName = functionContextStack.last else {
       return .visitChildren
@@ -315,7 +299,6 @@ private class FunctionVisitor: SyntaxVisitor {
       } else if let typeNode = parent.as(ActorDeclSyntax.self) {
         context = typeNode.name.text + "." + context
       } else if let typeNode = parent.as(ExtensionDeclSyntax.self) {
-          // For extensions, we just get the type name and stop traversing up.
           context = typeNode.extendedType.trimmedDescription + "." + context
           break
       }
@@ -411,11 +394,18 @@ private class FunctionVisitor: SyntaxVisitor {
     return false
   }
 
+  // MODIFIED: This function now captures the full range of the node.
   private func sourceLocation(for node: SyntaxProtocol) -> SourceLocation {
     let converter = SourceLocationConverter(
       fileName: fileURL.path, tree: node.root.as(SourceFileSyntax.self)!)
-    let location = node.startLocation(converter: converter)
+    let start = node.startLocation(converter: converter)
+    let end = node.endLocation(converter: converter)
     return SourceLocation(
-      filePath: fileURL.path, line: location.line, column: location.column)
+        filePath: fileURL.path,
+        line: start.line,
+        column: start.column,
+        endLine: end.line,
+        endColumn: end.column
+    )
   }
 }
