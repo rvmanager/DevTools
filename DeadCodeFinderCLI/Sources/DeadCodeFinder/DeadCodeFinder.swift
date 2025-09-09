@@ -177,7 +177,6 @@ struct DeadCodeFinder: ParsableCommand {
     }
 
     // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
-    // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
     log("--- STAGE 3: Building Call Graph ---")
     let callGraph = CallGraph(definitions: hydratedDefinitions, index: index, verbose: verbose)
 
@@ -189,9 +188,9 @@ struct DeadCodeFinder: ParsableCommand {
     log("Analysis complete. Found \(deadSymbols.count) dead symbols.")
 
     // --- REPORTING ---
-    // MODIFICATION: Call the new function to report any unmapped references.
-    callGraph.reportUnmappedReferences()
-
+    // MODIFICATION: Call the new dump function to print every reference.
+    callGraph.dumpAllProcessedReferences()
+    
     report(deadSymbols, callGraph: callGraph)
   }
 
