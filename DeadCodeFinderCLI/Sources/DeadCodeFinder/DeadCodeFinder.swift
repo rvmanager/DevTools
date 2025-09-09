@@ -28,6 +28,9 @@ struct DeadCodeFinder: ParsableCommand {
   @Flag(help: "Dumps all symbols from SwiftSyntax and IndexStoreDB for debugging and then exits.")
   private var dumpSymbols: Bool = false
 
+  @Flag(help: "Enable detailed USR matching debug information.")
+  private var debugUSR: Bool = false
+
   func validate() throws {
     log("Validating input paths...")
     let absolutePath = resolveAbsolutePath(projectPath)
@@ -85,6 +88,8 @@ struct DeadCodeFinder: ParsableCommand {
     // This provides the mapping from a location (file + line) to the definitive USR.
     // Map: [FilePath: [LineNumber: USR]]
     var usrLookup: [String: [Int: String]] = [:]
+    var indexSymbolsByFile: [String: [(line: Int, symbol: String, usr: String)]] = [:]
+
     for fileURL in swiftFiles {
       let occurrences = index.store.symbolOccurrences(inFilePath: fileURL.path)
       let canonicalDefinitions = occurrences.filter {
@@ -93,24 +98,62 @@ struct DeadCodeFinder: ParsableCommand {
 
       for occ in canonicalDefinitions {
         usrLookup[occ.location.path, default: [:]][occ.location.line] = occ.symbol.usr
+        indexSymbolsByFile[occ.location.path, default: []].append(
+          (
+            line: occ.location.line,
+            symbol: occ.symbol.name,
+            usr: occ.symbol.usr
+          ))
       }
     }
     log("Built a USR lookup map from IndexStore's canonical symbols.")
+
+    if debugUSR {
+      log("=== USR DEBUG MODE ===")
+      for (filePath, symbols) in indexSymbolsByFile.sorted(by: { $0.key < $1.key }) {
+        log("IndexStore symbols in \(filePath):")
+        for symbol in symbols.sorted(by: { $0.line < $1.line }) {
+          log("  Line \(symbol.line): \(symbol.symbol) -> \(symbol.usr)")
+        }
+      }
+    }
 
     // Step 2: Hydrate the syntax definitions with their canonical USRs.
     // The `syntaxDefs` are the source of truth for ranges and entry points.
     // We enrich them with the USR from the lookup map.
     var hydratedDefinitions: [SourceDefinition] = []
     var unmappedCount = 0
+    var exactMatches = 0
+    var fuzzyMatches = 0
+
     for var def in syntaxAnalysis.definitions {
-      if let usr = usrLookup[def.location.filePath]?[def.location.line] {
+      if let usr = findUSRForDefinition(
+        name: def.name, location: def.location, usrLookup: usrLookup, debugUSR: debugUSR)
+      {
         def.usr = usr
         hydratedDefinitions.append(def)
+
+        // Track match type for statistics
+        if usrLookup[def.location.filePath]?[def.location.line] != nil {
+          exactMatches += 1
+        } else {
+          fuzzyMatches += 1
+        }
       } else {
         unmappedCount += 1
-        log(
-          "Could not find a canonical USR for syntax definition: \(def.name) at \(def.location.description)"
-        )
+        if debugUSR {
+          log("❌ Could not find USR for: \(def.name) at \(def.location.description)")
+          if let symbolsInFile = indexSymbolsByFile[def.location.filePath] {
+            log("   Available IndexStore symbols in this file:")
+            for symbol in symbolsInFile.sorted(by: { $0.line < $1.line }) {
+              log("     Line \(symbol.line): \(symbol.symbol)")
+            }
+          }
+        } else {
+          log(
+            "Could not find a canonical USR for syntax definition: \(def.name) at \(def.location.description)"
+          )
+        }
       }
     }
 
@@ -118,6 +161,13 @@ struct DeadCodeFinder: ParsableCommand {
     log(
       "Successfully hydrated \(hydratedDefinitions.count) definitions with USRs. \(entryPointCount) marked as entry points. \(unmappedCount) definitions could not be mapped."
     )
+
+    if debugUSR {
+      log("USR Matching Statistics:")
+      log("  Exact matches: \(exactMatches)")
+      log("  Fuzzy matches: \(fuzzyMatches)")
+      log("  Unmapped: \(unmappedCount)")
+    }
 
     // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
     log("--- STAGE 3: Building Call Graph ---")
@@ -132,6 +182,60 @@ struct DeadCodeFinder: ParsableCommand {
 
     // --- REPORTING ---
     report(deadSymbols)
+  }
+
+  private func findUSRForDefinition(
+    name: String, location: SourceLocation, usrLookup: [String: [Int: String]], debugUSR: Bool
+  ) -> String? {
+    let filePath = location.filePath
+
+    // Try exact match first
+    if let usr = usrLookup[filePath]?[location.line] {
+      if debugUSR {
+        log("✅ Exact USR match for \(name) at line \(location.line)")
+      }
+      return usr
+    }
+
+    // Try nearby lines (±5 lines for better coverage)
+    for offset in 1...5 {
+      // Try lines after
+      if let usr = usrLookup[filePath]?[location.line + offset] {
+        if debugUSR {
+          log(
+            "✅ Fuzzy USR match for \(name) at line \(location.line + offset) (offset +\(offset) from SwiftSyntax line \(location.line))"
+          )
+        }
+        return usr
+      }
+
+      // Try lines before
+      let beforeLine = location.line - offset
+      if beforeLine > 0, let usr = usrLookup[filePath]?[beforeLine] {
+        if debugUSR {
+          log(
+            "✅ Fuzzy USR match for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(location.line))"
+          )
+        }
+        return usr
+      }
+    }
+
+    // For structs/classes/enums, also try looking for any USR in the declaration range
+    if location.endLine > location.line {
+      for line in location.line...min(location.line + 20, location.endLine) {
+        if let usr = usrLookup[filePath]?[line] {
+          if debugUSR {
+            log(
+              "✅ Range USR match for \(name) at line \(line) (SwiftSyntax range: \(location.line)-\(location.endLine))"
+            )
+          }
+          return usr
+        }
+      }
+    }
+
+    return nil
   }
 
   private func report(_ unusedSymbols: [SourceDefinition]) {
