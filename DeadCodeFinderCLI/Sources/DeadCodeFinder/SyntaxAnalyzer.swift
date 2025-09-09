@@ -6,7 +6,7 @@ import SwiftSyntax
 
 struct AnalysisResult {
   let definitions: [SourceDefinition]
-  let calls: [FunctionCall]
+  let calls: [FunctionCall]  // DEPRECATED: Not used in analysis, kept for compatibility
   let entryPoints: [SourceDefinition]
 }
 
@@ -114,7 +114,7 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
     let name = node.name.text
     let fullName = createUniqueName(baseName: name, node: node)
-    let location = sourceLocation(for: node)
+    let location = sourceLocation(for: node) // Use the whole node for range
 
     var isEntryPoint = false
     if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
@@ -122,8 +122,7 @@ private class FunctionVisitor: SyntaxVisitor {
         let typeDescription = $0.type.description
         let isEntryPointType =
           typeDescription.contains("View") || typeDescription.contains("App")
-          || typeDescription.contains("ParsableCommand") || typeDescription.contains("Decodable")
-          || typeDescription.contains("Codable")
+          || typeDescription.contains("ParsableCommand") || typeDescription.contains("Decodable") || typeDescription.contains("Codable")
         if isEntryPointType && verbose {
           log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
         }
@@ -144,24 +143,23 @@ private class FunctionVisitor: SyntaxVisitor {
       isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
-
+    
     if isEntryPoint && (node.inheritanceClause?.description.contains("Decodable") ?? false) {
-      for member in node.memberBlock.members {
-        if let varDecl = member.decl.as(VariableDeclSyntax.self) {
-          for binding in varDecl.bindings {
-            if let pattern = binding.pattern.as(IdentifierPatternSyntax.self) {
-              let propName = pattern.identifier.text
-              let propFullName = fullName + "." + propName
-              let propLocation = sourceLocation(for: pattern.identifier)
-              let propDef = SourceDefinition(
-                name: propFullName, kind: .variable, location: propLocation, isEntryPoint: true)
-              definitions.append(propDef)
+        for member in node.memberBlock.members {
+            if let varDecl = member.decl.as(VariableDeclSyntax.self) {
+                for binding in varDecl.bindings {
+                    if let pattern = binding.pattern.as(IdentifierPatternSyntax.self) {
+                        let propName = pattern.identifier.text
+                        let propFullName = fullName + "." + propName
+                        let propLocation = sourceLocation(for: pattern.identifier)
+                        let propDef = SourceDefinition(name: propFullName, kind: .variable, location: propLocation, isEntryPoint: true)
+                        definitions.append(propDef)
+                    }
+                }
             }
-          }
         }
-      }
     }
-
+    
     enterScope(name: name, node: node)
     return .visitChildren
   }
@@ -228,12 +226,12 @@ private class FunctionVisitor: SyntaxVisitor {
         continue
       }
       let varName = pattern.identifier.text
-
+      
       // We only care about member variables that are computed properties (have a body)
       guard node.parent?.is(MemberBlockSyntax.self) == true, binding.accessorBlock != nil else {
         continue
       }
-
+      
       let fullName = createUniqueName(baseName: varName, node: node)
       let location = sourceLocation(for: node)
 
@@ -339,18 +337,18 @@ private class FunctionVisitor: SyntaxVisitor {
   override func visitPost(_ node: InitializerDeclSyntax) {
     exitScope()
   }
-
+  
   // --- THIS IS THE FIX ---
   // Visit closures and treat them as temporary, unnamed function scopes.
   override func visit(_ node: ClosureExprSyntax) -> SyntaxVisitorContinueKind {
-    // Create a unique but descriptive name for the closure based on its location
-    let closureName = "closure_\(node.position.utf8Offset)"
-    enterScope(name: closureName, node: node)
-    return .visitChildren
+      // Create a unique but descriptive name for the closure based on its location
+      let closureName = "closure_\(node.position.utf8Offset)"
+      enterScope(name: closureName, node: node)
+      return .visitChildren
   }
 
   override func visitPost(_ node: ClosureExprSyntax) {
-    exitScope()
+      exitScope()
   }
   // --- END FIX ---
 
@@ -402,6 +400,22 @@ private class FunctionVisitor: SyntaxVisitor {
     if verbose {
       print("[VISITOR] \(message)")
     }
+  }
+
+  private func getCurrentTypeContext() -> String {
+    // Walk up the context stack to find the nearest type (struct/class/enum)
+    for context in contextStack.reversed() {
+      // Extract the type name from contexts like "RefreshSchedulingService.calculateNextRefreshDate"
+      let components = context.components(separatedBy: ".")
+      if components.count >= 1 {
+        let firstComponent = components[0]
+        // Check if this looks like a type name (starts with uppercase)
+        if let firstChar = firstComponent.first, firstChar.isUppercase {
+          return firstComponent
+        }
+      }
+    }
+    return ""
   }
 
   private func createUniqueName(baseName: String, node: SyntaxProtocol) -> String {
@@ -542,11 +556,9 @@ private class FunctionVisitor: SyntaxVisitor {
   }
 
   // Debug helper to try multiple line positions for USR lookup
-  private func findUSRForDefinition(
-    name: String, primaryLocation: SourceLocation, usrLookup: [String: [Int: String]]
-  ) -> String? {
+  private func findUSRForDefinition(name: String, primaryLocation: SourceLocation, usrLookup: [String: [Int: String]]) -> String? {
     let filePath = primaryLocation.filePath
-
+    
     // Try exact match first
     if let usr = usrLookup[filePath]?[primaryLocation.line] {
       if verbose {
@@ -554,45 +566,39 @@ private class FunctionVisitor: SyntaxVisitor {
       }
       return usr
     }
-
+    
     // Try nearby lines (±3 lines)
     for offset in 1...3 {
       // Try lines after
       if let usr = usrLookup[filePath]?[primaryLocation.line + offset] {
         if verbose {
-          log(
-            "Found USR for \(name) at line \(primaryLocation.line + offset) (offset +\(offset) from SwiftSyntax line \(primaryLocation.line))"
-          )
+          log("Found USR for \(name) at line \(primaryLocation.line + offset) (offset +\(offset) from SwiftSyntax line \(primaryLocation.line))")
         }
         return usr
       }
-
+      
       // Try lines before
       let beforeLine = primaryLocation.line - offset
       if beforeLine > 0, let usr = usrLookup[filePath]?[beforeLine] {
         if verbose {
-          log(
-            "Found USR for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(primaryLocation.line))"
-          )
+          log("Found USR for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(primaryLocation.line))")
         }
         return usr
       }
     }
-
+    
     // For structs/classes, also try looking for any USR in a wider range (the body)
     if primaryLocation.endLine > primaryLocation.line {
       for line in primaryLocation.line...min(primaryLocation.line + 10, primaryLocation.endLine) {
         if let usr = usrLookup[filePath]?[line] {
           if verbose {
-            log(
-              "Found USR for \(name) in body range at line \(line) (SwiftSyntax range: \(primaryLocation.line)-\(primaryLocation.endLine))"
-            )
+            log("Found USR for \(name) in body range at line \(line) (SwiftSyntax range: \(primaryLocation.line)-\(primaryLocation.endLine))")
           }
           return usr
         }
       }
     }
-
+    
     return nil
   }
 }

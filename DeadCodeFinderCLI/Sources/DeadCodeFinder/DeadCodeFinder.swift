@@ -30,6 +30,7 @@ struct DeadCodeFinder: ParsableCommand {
 
   @Flag(help: "Enable detailed USR matching debug information.")
   private var debugUSR: Bool = false
+  
 
   func validate() throws {
     log("Validating input paths...")
@@ -89,8 +90,8 @@ struct DeadCodeFinder: ParsableCommand {
     // Map: [FilePath: [LineNumber: USR]]
     var usrLookup: [String: [Int: String]] = [:]
     var indexSymbolsByFile: [String: [(line: Int, symbol: String, usr: String)]] = [:]
-    var nameBasedLookup: [String: [String: String]] = [:]
-
+    var nameBasedLookup: [String: [String: String]] = [:] // Add this line
+    
     for fileURL in swiftFiles {
       let occurrences = index.store.symbolOccurrences(inFilePath: fileURL.path)
       let canonicalDefinitions = occurrences.filter {
@@ -99,16 +100,14 @@ struct DeadCodeFinder: ParsableCommand {
 
       for occ in canonicalDefinitions {
         usrLookup[occ.location.path, default: [:]][occ.location.line] = occ.symbol.usr
-        indexSymbolsByFile[occ.location.path, default: []].append(
-          (
-            line: occ.location.line,
-            symbol: occ.symbol.name,
-            usr: occ.symbol.usr
-          ))
-
-        // Build name-based lookup: extract method name from symbol name
+        indexSymbolsByFile[occ.location.path, default: []].append((
+          line: occ.location.line,
+          symbol: occ.symbol.name,
+          usr: occ.symbol.usr
+        ))
+        
+        // Add this block
         let symbolName = occ.symbol.name
-        // Remove parentheses and parameters for matching
         let cleanName = symbolName.components(separatedBy: "(").first ?? symbolName
         nameBasedLookup[occ.location.path, default: [:]][cleanName] = occ.symbol.usr
       }
@@ -132,15 +131,12 @@ struct DeadCodeFinder: ParsableCommand {
     var unmappedCount = 0
     var exactMatches = 0
     var fuzzyMatches = 0
-
+    
     for var def in syntaxAnalysis.definitions {
-      if let usr = findUSRForDefinition(
-        name: def.name, location: def.location, usrLookup: usrLookup,
-        nameBasedLookup: nameBasedLookup, debugUSR: debugUSR)
-      {
+      if let usr = findUSRForDefinition(name: def.name, location: def.location, usrLookup: usrLookup, nameBasedLookup: nameBasedLookup, debugUSR: debugUSR) {
         def.usr = usr
         hydratedDefinitions.append(def)
-
+        
         // Track match type for statistics
         if usrLookup[def.location.filePath]?[def.location.line] != nil {
           exactMatches += 1
@@ -158,9 +154,7 @@ struct DeadCodeFinder: ParsableCommand {
             }
           }
         } else {
-          log(
-            "Could not find a canonical USR for syntax definition: \(def.name) at \(def.location.description)"
-          )
+          log("Could not find a canonical USR for syntax definition: \(def.name) at \(def.location.description)")
         }
       }
     }
@@ -169,7 +163,7 @@ struct DeadCodeFinder: ParsableCommand {
     log(
       "Successfully hydrated \(hydratedDefinitions.count) definitions with USRs. \(entryPointCount) marked as entry points. \(unmappedCount) definitions could not be mapped."
     )
-
+    
     if debugUSR {
       log("USR Matching Statistics:")
       log("  Exact matches: \(exactMatches)")
@@ -177,6 +171,7 @@ struct DeadCodeFinder: ParsableCommand {
       log("  Unmapped: \(unmappedCount)")
     }
 
+    // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
     // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
     log("--- STAGE 3: Building Call Graph ---")
     let callGraph = CallGraph(definitions: hydratedDefinitions, index: index, verbose: verbose)
@@ -189,15 +184,12 @@ struct DeadCodeFinder: ParsableCommand {
     log("Analysis complete. Found \(deadSymbols.count) dead symbols.")
 
     // --- REPORTING ---
-    report(deadSymbols)
+    report(deadSymbols, callGraph: callGraph)
   }
 
-  private func findUSRForDefinition(
-    name: String, location: SourceLocation, usrLookup: [String: [Int: String]],
-    nameBasedLookup: [String: [String: String]], debugUSR: Bool
-  ) -> String? {
+  private func findUSRForDefinition(name: String, location: SourceLocation, usrLookup: [String: [Int: String]], nameBasedLookup: [String: [String: String]], debugUSR: Bool) -> String? {
     let filePath = location.filePath
-
+    
     // Try exact match first
     if let usr = usrLookup[filePath]?[location.line] {
       if debugUSR {
@@ -205,50 +197,44 @@ struct DeadCodeFinder: ParsableCommand {
       }
       return usr
     }
-
+    
     // Try nearby lines (±5 lines for better coverage)
     for offset in 1...5 {
       // Try lines after
       if let usr = usrLookup[filePath]?[location.line + offset] {
         if debugUSR {
-          log(
-            "✅ Fuzzy USR match for \(name) at line \(location.line + offset) (offset +\(offset) from SwiftSyntax line \(location.line))"
-          )
+          log("✅ Fuzzy USR match for \(name) at line \(location.line + offset) (offset +\(offset) from SwiftSyntax line \(location.line))")
         }
         return usr
       }
-
+      
       // Try lines before
       let beforeLine = location.line - offset
       if beforeLine > 0, let usr = usrLookup[filePath]?[beforeLine] {
         if debugUSR {
-          log(
-            "✅ Fuzzy USR match for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(location.line))"
-          )
+          log("✅ Fuzzy USR match for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(location.line))")
         }
         return usr
       }
     }
-
+    
     // For structs/classes/enums, also try looking for any USR in the declaration range
     if location.endLine > location.line {
       for line in location.line...min(location.line + 20, location.endLine) {
         if let usr = usrLookup[filePath]?[line] {
           if debugUSR {
-            log(
-              "✅ Range USR match for \(name) at line \(line) (SwiftSyntax range: \(location.line)-\(location.endLine))"
-            )
+            log("✅ Range USR match for \(name) at line \(line) (SwiftSyntax range: \(location.line)-\(location.endLine))")
           }
           return usr
         }
       }
     }
-
+    
     // Try name-based matching (ignoring line numbers completely)
     if let nameMap = nameBasedLookup[filePath] {
       // Extract the method name from the full name (e.g., "VideoPlayerView.setupPlayer" -> "setupPlayer")
       let methodName = name.components(separatedBy: ".").last ?? name
-
+      
       // Try exact method name match
       if let usr = nameMap[methodName] {
         if debugUSR {
@@ -257,11 +243,11 @@ struct DeadCodeFinder: ParsableCommand {
         return usr
       }
     }
-
+    
     return nil
   }
 
-  private func report(_ unusedSymbols: [SourceDefinition]) {
+private func report(_ unusedSymbols: [SourceDefinition], callGraph: CallGraph) {
     if unusedSymbols.isEmpty {
       print("\n✅ No unused symbols found. Excellent!")
     } else {
