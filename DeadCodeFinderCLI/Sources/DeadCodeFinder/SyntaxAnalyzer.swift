@@ -89,7 +89,7 @@ private class FunctionVisitor: SyntaxVisitor {
   private(set) var definitions: [SourceDefinition] = []
   private(set) var calls: [FunctionCall] = []
 
-  private var functionContextStack: [String] = []
+  private var contextStack: [String] = []
 
   init(fileURL: URL, verbose: Bool) {
     self.fileURL = fileURL
@@ -97,22 +97,32 @@ private class FunctionVisitor: SyntaxVisitor {
     super.init(viewMode: .sourceAccurate)
   }
 
+  // --- THIS IS THE FIX ---
+  // Generic entrance handler for any declaration that creates a new scope.
+  // It creates a unique name for the scope and pushes it onto the context stack.
+  private func enterScope(name: String, node: SyntaxProtocol) {
+    let fullName = createUniqueName(baseName: name, node: node)
+    contextStack.append(fullName)
+  }
+
+  // Generic exit handler to pop the context when leaving a scope.
+  private func exitScope() {
+    _ = contextStack.popLast()
+  }
+  // --- END FIX ---
+
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
     let name = node.name.text
-    let fullName = createUniqueName(functionName: name, node: node)
-    let location = sourceLocation(for: node.name)
+    let fullName = createUniqueName(baseName: name, node: node)
+    let location = sourceLocation(for: node) // Use the whole node for range
 
     var isEntryPoint = false
     if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
       isEntryPoint = inheritedTypes.contains {
         let typeDescription = $0.type.description
-        // --- THIS IS THE FIX ---
-        // Mark any Decodable or Codable struct as an entry point, as its members
-        // are used implicitly by JSONDecoder.
         let isEntryPointType =
           typeDescription.contains("View") || typeDescription.contains("App")
           || typeDescription.contains("ParsableCommand") || typeDescription.contains("Decodable") || typeDescription.contains("Codable")
-        // --- END FIX ---
         if isEntryPointType && verbose {
           log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
         }
@@ -134,8 +144,6 @@ private class FunctionVisitor: SyntaxVisitor {
     )
     definitions.append(definition)
     
-    // --- THIS IS THE FIX ---
-    // If the struct is decodable, all its properties are also entry points.
     if isEntryPoint && (node.inheritanceClause?.description.contains("Decodable") ?? false) {
         for member in node.memberBlock.members {
             if let varDecl = member.decl.as(VariableDeclSyntax.self) {
@@ -151,20 +159,19 @@ private class FunctionVisitor: SyntaxVisitor {
             }
         }
     }
-    // --- END FIX ---
     
-    functionContextStack.append(fullName)
+    enterScope(name: name, node: node)
     return .visitChildren
   }
 
   override func visitPost(_ node: StructDeclSyntax) {
-    _ = functionContextStack.popLast()
+    exitScope()
   }
 
   override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
     let name = node.name.text
-    let fullName = createUniqueName(functionName: name, node: node)
-    let location = sourceLocation(for: node.name)
+    let fullName = createUniqueName(baseName: name, node: node)
+    let location = sourceLocation(for: node)
 
     var isEntryPoint = false
     if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
@@ -185,18 +192,18 @@ private class FunctionVisitor: SyntaxVisitor {
       isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
-    functionContextStack.append(fullName)
+    enterScope(name: name, node: node)
     return .visitChildren
   }
 
   override func visitPost(_ node: ClassDeclSyntax) {
-    _ = functionContextStack.popLast()
+    exitScope()
   }
 
   override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
     let name = node.name.text
-    let fullName = createUniqueName(functionName: name, node: node)
-    let location = sourceLocation(for: node.name)
+    let fullName = createUniqueName(baseName: name, node: node)
+    let location = sourceLocation(for: node)
 
     let definition = SourceDefinition(
       name: fullName,
@@ -205,27 +212,28 @@ private class FunctionVisitor: SyntaxVisitor {
       isEntryPoint: false
     )
     definitions.append(definition)
-    functionContextStack.append(fullName)
+    enterScope(name: name, node: node)
     return .visitChildren
   }
 
   override func visitPost(_ node: EnumDeclSyntax) {
-    _ = functionContextStack.popLast()
+    exitScope()
   }
 
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-    guard node.parent?.is(MemberBlockSyntax.self) == true else {
-        return .visitChildren
-    }
-
     for binding in node.bindings {
       guard let pattern = binding.pattern.as(IdentifierPatternSyntax.self) else {
         continue
       }
-
       let varName = pattern.identifier.text
-      let fullName = createUniqueName(functionName: varName, node: node)
-      let location = sourceLocation(for: pattern.identifier)
+      
+      // We only care about member variables that are computed properties (have a body)
+      guard node.parent?.is(MemberBlockSyntax.self) == true, binding.accessorBlock != nil else {
+        continue
+      }
+      
+      let fullName = createUniqueName(baseName: varName, node: node)
+      let location = sourceLocation(for: node)
 
       var isEntryPoint = false
       if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
@@ -245,32 +253,24 @@ private class FunctionVisitor: SyntaxVisitor {
         name: fullName, kind: .variable, location: location, isEntryPoint: isEntryPoint
       )
       definitions.append(definition)
-      
-      if binding.accessorBlock != nil {
-          functionContextStack.append(fullName)
-      }
+      enterScope(name: varName, node: node)
     }
     return .visitChildren
   }
 
   override func visitPost(_ node: VariableDeclSyntax) {
-    guard node.parent?.is(MemberBlockSyntax.self) == true else {
-        return
-    }
-      
     for binding in node.bindings {
-      if binding.accessorBlock != nil,
-        binding.pattern.as(IdentifierPatternSyntax.self) != nil
-      {
-        _ = functionContextStack.popLast()
+      guard node.parent?.is(MemberBlockSyntax.self) == true, binding.accessorBlock != nil else {
+        continue
       }
+      exitScope()
     }
   }
 
   override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
     let funcName = node.name.text
-    let fullName = createUniqueName(functionName: funcName, node: node)
-    let location = sourceLocation(for: node.name)
+    let fullName = createUniqueName(baseName: funcName, node: node)
+    let location = sourceLocation(for: node)
 
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isModelMethod = isEnclosedInModel(node: node)
@@ -297,17 +297,17 @@ private class FunctionVisitor: SyntaxVisitor {
       name: fullName, kind: .function, location: location, isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
-    functionContextStack.append(fullName)
+    enterScope(name: funcName, node: node)
     return .visitChildren
   }
 
   override func visitPost(_ node: FunctionDeclSyntax) {
-    _ = functionContextStack.popLast()
+    exitScope()
   }
 
   override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
-    let fullName = createUniqueName(functionName: "init", node: node)
-    let location = sourceLocation(for: node.initKeyword)
+    let fullName = createUniqueName(baseName: "init", node: node)
+    let location = sourceLocation(for: node)
     let isOverridden = node.modifiers.contains { $0.name.text == "override" }
     let isPublic = node.modifiers.contains { $0.name.text == "public" }
     let isModelMethod = isEnclosedInModel(node: node)
@@ -330,16 +330,30 @@ private class FunctionVisitor: SyntaxVisitor {
       name: fullName, kind: .initializer, location: location, isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
-    functionContextStack.append(fullName)
+    enterScope(name: "init", node: node)
     return .visitChildren
   }
 
   override func visitPost(_ node: InitializerDeclSyntax) {
-    _ = functionContextStack.popLast()
+    exitScope()
+  }
+  
+  // --- THIS IS THE FIX ---
+  // Visit closures and treat them as temporary, unnamed function scopes.
+  override func visit(_ node: ClosureExprSyntax) -> SyntaxVisitorContinueKind {
+      // Create a unique but descriptive name for the closure based on its location
+      let closureName = "closure_\(node.position.utf8Offset)"
+      enterScope(name: closureName, node: node)
+      return .visitChildren
   }
 
+  override func visitPost(_ node: ClosureExprSyntax) {
+      exitScope()
+  }
+  // --- END FIX ---
+
   override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
-    guard let callerName = functionContextStack.last else {
+    guard let callerName = contextStack.last else {
       return .visitChildren
     }
     var calleeName = ""
@@ -360,7 +374,7 @@ private class FunctionVisitor: SyntaxVisitor {
   }
 
   override func visit(_ node: DeclReferenceExprSyntax) -> SyntaxVisitorContinueKind {
-    guard let callerName = functionContextStack.last else {
+    guard let callerName = contextStack.last else {
       return .visitChildren
     }
 
@@ -388,7 +402,7 @@ private class FunctionVisitor: SyntaxVisitor {
     }
   }
 
-  private func createUniqueName(functionName: String, node: SyntaxProtocol) -> String {
+  private func createUniqueName(baseName: String, node: SyntaxProtocol) -> String {
     var context = ""
     var current: Syntax? = node._syntaxNode
     while let parent = current?.parent {
@@ -406,7 +420,7 @@ private class FunctionVisitor: SyntaxVisitor {
       }
       current = parent
     }
-    return context + functionName
+    return context + baseName
   }
 
   private func findEnclosingStruct(for node: SyntaxProtocol) -> StructDeclSyntax? {
