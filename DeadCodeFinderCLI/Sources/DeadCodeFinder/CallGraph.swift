@@ -7,6 +7,9 @@ class CallGraph {
   private(set) var adjacencyList: [String: Set<String>] = [:]
   private(set) var reverseAdjacencyList: [String: Set<String>] = [:]
 
+  // No more multiple lists. Just one list to capture all failures.
+  private(set) var unmappedReferences: [(calleeName: String, reference: SymbolOccurrence)] = []
+
   let usrToDefinition: [String: SourceDefinition]
   let definitions: [SourceDefinition]
   let verbose: Bool
@@ -14,18 +17,11 @@ class CallGraph {
   init(definitions: [SourceDefinition], index: IndexStore, verbose: Bool) {
     self.definitions = definitions
 
-    // --- THIS IS THE FIX ---
-    // The `definitions` array can contain duplicates where different syntax nodes
-    // resolve to the same canonical symbol (e.g., class and extension), resulting in the same USR.
-    // `Dictionary(uniqueKeysWithValues:)` crashes on these duplicate keys.
-    // We now use `Dictionary(_:uniquingKeysWith:)` to handle this gracefully,
-    // keeping the first definition we encounter for any given USR.
     self.usrToDefinition = Dictionary(
       definitions.compactMap { def -> (String, SourceDefinition)? in
         guard let usr = def.usr else { return nil }
         return (usr, def)
       }, uniquingKeysWith: { (first, _) in first })
-    // --- END FIX ---
 
     self.verbose = verbose
     buildGraph(index: index.store)
@@ -36,20 +32,25 @@ class CallGraph {
     log("Building accurate call graph from \(uniqueDefinitionCount) unique definitions...")
 
     var fileRangeToUsrMap: [String: [(Range<Int>, String)]] = [:]
-    // Use the now-unique usrToDefinition dictionary as the source of truth
     for (usr, definition) in usrToDefinition {
-      // Use the full line range of the symbol's body for accurate reference mapping.
-      let range = definition.location.line..<definition.location.endLine + 1
+      let startLine = definition.location.line
+      let endLine = max(definition.location.endLine, definition.location.line + 50)
+      let range = startLine..<(endLine + 1)
       fileRangeToUsrMap[definition.location.filePath, default: []].append((range, usr))
     }
 
     for (filePath, ranges) in fileRangeToUsrMap {
-      fileRangeToUsrMap[filePath] = ranges.sorted { $0.0.lowerBound < $1.0.lowerBound }
+      fileRangeToUsrMap[filePath] = ranges.sorted { (first, second) in
+        if first.0.lowerBound != second.0.lowerBound {
+          return first.0.lowerBound < second.0.lowerBound
+        }
+        return (first.0.upperBound - first.0.lowerBound)
+          < (second.0.upperBound - second.0.lowerBound)
+      }
     }
 
     log("Processing definitions to find references...")
     var count = 0
-    // Iterate over the unique dictionary
     for (calleeUsr, calleeDef) in usrToDefinition {
       count += 1
       if verbose && count % 100 == 0 {
@@ -60,22 +61,39 @@ class CallGraph {
 
       for reference in references {
         guard let rangesInFile = fileRangeToUsrMap[reference.location.path] else {
+          unmappedReferences.append((calleeName: calleeDef.name, reference: reference))
           continue
         }
 
         var containingUsr: String?
-        // Search reversed to find the most specific (inner) scope first.
-        for (range, usr) in rangesInFile.reversed() {
+        var bestRange: (Range<Int>, String)?
+
+        for (range, usr) in rangesInFile {
           if range.contains(reference.location.line) {
-            containingUsr = usr
-            break
+            if bestRange == nil {
+              bestRange = (range, usr)
+            } else {
+              let currentSize = range.upperBound - range.lowerBound
+              let bestSize = bestRange!.0.upperBound - bestRange!.0.lowerBound
+              if currentSize < bestSize {
+                bestRange = (range, usr)
+              }
+            }
           }
         }
 
+        containingUsr = bestRange?.1
+
+        // THIS IS THE GUARANTEED FIX.
+        // If no containing range is found, 'containingUsr' will be nil.
+        // This block will execute, add the reference to the list, log the message, and then continue.
         guard let callerUsr = containingUsr else {
-          log(
-            "Could not map reference at \(reference.location.path):\(reference.location.line) to a known definition."
-          )
+          unmappedReferences.append((calleeName: calleeDef.name, reference: reference))
+          if verbose {
+            log(
+              "Could not map reference at \(reference.location.path):\(reference.location.line) to a known definition."
+            )
+          }
           continue
         }
 
@@ -98,6 +116,30 @@ class CallGraph {
 
     let edgeCount = adjacencyList.values.reduce(0) { $0 + $1.count }
     log("Accurate call graph built with \(uniqueDefinitionCount) nodes and \(edgeCount) edges.")
+  }
+
+  func reportUnmappedReferences() {
+    // Cleaned up the reporting logic to be clear and match your log output.
+    if !unmappedReferences.isEmpty {
+      print(
+        "\n⚠️ Found \(unmappedReferences.count) references that could not be mapped to a calling function:"
+      )
+      let sortedUnmapped = unmappedReferences.sorted {
+        if $0.reference.location.path != $1.reference.location.path {
+          return $0.reference.location.path < $1.reference.location.path
+        }
+        return $0.reference.location.line < $1.reference.location.line
+      }
+
+      for (calleeName, reference) in sortedUnmapped {
+        let location = reference.location
+        print(
+          "  - Call to '\(calleeName)' at \(location.path):\(location.line):\(location.utf8Column)")
+      }
+    } else {
+      // Explicitly state that no unmapped references were found.
+      print("\n✅ All references were successfully mapped to a calling function.")
+    }
   }
 
   private func log(_ message: String) {

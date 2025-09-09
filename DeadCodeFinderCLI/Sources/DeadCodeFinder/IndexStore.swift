@@ -41,11 +41,9 @@ class IndexStore {
         listenToUnitEvents: false
       )
 
-      // --- THIS IS THE FIX ---
       // Explicitly wait for the index store to process any new unit files.
       // Without this, the database will be empty and all queries will fail.
       self.store.pollForUnitChangesAndWait()
-      // -----------------------
 
       self.log("IndexStoreDB opened and synchronized successfully.")
     } catch {
