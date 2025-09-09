@@ -89,6 +89,7 @@ struct DeadCodeFinder: ParsableCommand {
     // Map: [FilePath: [LineNumber: USR]]
     var usrLookup: [String: [Int: String]] = [:]
     var indexSymbolsByFile: [String: [(line: Int, symbol: String, usr: String)]] = [:]
+    var nameBasedLookup: [String: [String: String]] = [:]
 
     for fileURL in swiftFiles {
       let occurrences = index.store.symbolOccurrences(inFilePath: fileURL.path)
@@ -104,6 +105,12 @@ struct DeadCodeFinder: ParsableCommand {
             symbol: occ.symbol.name,
             usr: occ.symbol.usr
           ))
+
+        // Build name-based lookup: extract method name from symbol name
+        let symbolName = occ.symbol.name
+        // Remove parentheses and parameters for matching
+        let cleanName = symbolName.components(separatedBy: "(").first ?? symbolName
+        nameBasedLookup[occ.location.path, default: [:]][cleanName] = occ.symbol.usr
       }
     }
     log("Built a USR lookup map from IndexStore's canonical symbols.")
@@ -128,7 +135,8 @@ struct DeadCodeFinder: ParsableCommand {
 
     for var def in syntaxAnalysis.definitions {
       if let usr = findUSRForDefinition(
-        name: def.name, location: def.location, usrLookup: usrLookup, debugUSR: debugUSR)
+        name: def.name, location: def.location, usrLookup: usrLookup,
+        nameBasedLookup: nameBasedLookup, debugUSR: debugUSR)
       {
         def.usr = usr
         hydratedDefinitions.append(def)
@@ -185,7 +193,8 @@ struct DeadCodeFinder: ParsableCommand {
   }
 
   private func findUSRForDefinition(
-    name: String, location: SourceLocation, usrLookup: [String: [Int: String]], debugUSR: Bool
+    name: String, location: SourceLocation, usrLookup: [String: [Int: String]],
+    nameBasedLookup: [String: [String: String]], debugUSR: Bool
   ) -> String? {
     let filePath = location.filePath
 
@@ -232,6 +241,20 @@ struct DeadCodeFinder: ParsableCommand {
           }
           return usr
         }
+      }
+    }
+
+    // Try name-based matching (ignoring line numbers completely)
+    if let nameMap = nameBasedLookup[filePath] {
+      // Extract the method name from the full name (e.g., "VideoPlayerView.setupPlayer" -> "setupPlayer")
+      let methodName = name.components(separatedBy: ".").last ?? name
+
+      // Try exact method name match
+      if let usr = nameMap[methodName] {
+        if debugUSR {
+          log("✅ Name-based USR match for \(name) using method name '\(methodName)'")
+        }
+        return usr
       }
     }
 
