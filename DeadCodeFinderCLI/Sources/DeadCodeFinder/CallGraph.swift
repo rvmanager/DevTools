@@ -16,7 +16,7 @@ class CallGraph {
 
     // --- THIS IS THE FIX ---
     // The `definitions` array can contain duplicates where different syntax nodes
-    // resolve to the same canonical symbol, resulting in the same USR.
+    // resolve to the same canonical symbol (e.g., class and extension), resulting in the same USR.
     // `Dictionary(uniqueKeysWithValues:)` crashes on these duplicate keys.
     // We now use `Dictionary(_:uniquingKeysWith:)` to handle this gracefully,
     // keeping the first definition we encounter for any given USR.
@@ -32,11 +32,13 @@ class CallGraph {
   }
 
   private func buildGraph(index: IndexStoreDB) {
-    log("Building accurate call graph from \(usrToDefinition.count) unique definitions...")
+    let uniqueDefinitionCount = usrToDefinition.count
+    log("Building accurate call graph from \(uniqueDefinitionCount) unique definitions...")
 
     var fileRangeToUsrMap: [String: [(Range<Int>, String)]] = [:]
     // Use the now-unique usrToDefinition dictionary as the source of truth
     for (usr, definition) in usrToDefinition {
+      // Use the full line range of the symbol's body for accurate reference mapping.
       let range = definition.location.line..<definition.location.endLine + 1
       fileRangeToUsrMap[definition.location.filePath, default: []].append((range, usr))
     }
@@ -51,7 +53,7 @@ class CallGraph {
     for (calleeUsr, calleeDef) in usrToDefinition {
       count += 1
       if verbose && count % 100 == 0 {
-        log("...processed \(count)/\(usrToDefinition.count) definitions for references")
+        log("...processed \(count)/\(uniqueDefinitionCount) definitions for references")
       }
 
       let references = index.occurrences(ofUSR: calleeUsr, roles: .reference)
@@ -62,6 +64,7 @@ class CallGraph {
         }
 
         var containingUsr: String?
+        // Search reversed to find the most specific (inner) scope first.
         for (range, usr) in rangesInFile.reversed() {
           if range.contains(reference.location.line) {
             containingUsr = usr
@@ -94,7 +97,7 @@ class CallGraph {
     }
 
     let edgeCount = adjacencyList.values.reduce(0) { $0 + $1.count }
-    log("Accurate call graph built with \(usrToDefinition.count) nodes and \(edgeCount) edges.")
+    log("Accurate call graph built with \(uniqueDefinitionCount) nodes and \(edgeCount) edges.")
   }
 
   private func log(_ message: String) {

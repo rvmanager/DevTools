@@ -106,9 +106,13 @@ private class FunctionVisitor: SyntaxVisitor {
     if let inheritedTypes = node.inheritanceClause?.inheritedTypes {
       isEntryPoint = inheritedTypes.contains {
         let typeDescription = $0.type.description
+        // --- THIS IS THE FIX ---
+        // Mark any Decodable or Codable struct as an entry point, as its members
+        // are used implicitly by JSONDecoder.
         let isEntryPointType =
           typeDescription.contains("View") || typeDescription.contains("App")
-          || typeDescription.contains("ParsableCommand")
+          || typeDescription.contains("ParsableCommand") || typeDescription.contains("Decodable") || typeDescription.contains("Codable")
+        // --- END FIX ---
         if isEntryPointType && verbose {
           log("Marking '\(fullName)' as entry point due to inheritance: \(typeDescription)")
         }
@@ -129,6 +133,26 @@ private class FunctionVisitor: SyntaxVisitor {
       isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
+    
+    // --- THIS IS THE FIX ---
+    // If the struct is decodable, all its properties are also entry points.
+    if isEntryPoint && (node.inheritanceClause?.description.contains("Decodable") ?? false) {
+        for member in node.memberBlock.members {
+            if let varDecl = member.decl.as(VariableDeclSyntax.self) {
+                for binding in varDecl.bindings {
+                    if let pattern = binding.pattern.as(IdentifierPatternSyntax.self) {
+                        let propName = pattern.identifier.text
+                        let propFullName = fullName + "." + propName
+                        let propLocation = sourceLocation(for: pattern.identifier)
+                        let propDef = SourceDefinition(name: propFullName, kind: .variable, location: propLocation, isEntryPoint: true)
+                        definitions.append(propDef)
+                    }
+                }
+            }
+        }
+    }
+    // --- END FIX ---
+    
     functionContextStack.append(fullName)
     return .visitChildren
   }
@@ -189,19 +213,13 @@ private class FunctionVisitor: SyntaxVisitor {
     _ = functionContextStack.popLast()
   }
 
-  // --- REFINED VARIABLE VISITOR ---
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-    // We only want to capture top-level computed properties, not local variables.
-    // A simple proxy for this is to check if we are currently inside a function context.
-    guard functionContextStack.last?.contains("(") != true else {
-      return .visitChildren
+    guard node.parent?.is(MemberBlockSyntax.self) == true else {
+        return .visitChildren
     }
 
     for binding in node.bindings {
-      // Ensure we are looking at a computed property (has an accessor block)
-      guard binding.accessorBlock != nil,
-        let pattern = binding.pattern.as(IdentifierPatternSyntax.self)
-      else {
+      guard let pattern = binding.pattern.as(IdentifierPatternSyntax.self) else {
         continue
       }
 
@@ -227,22 +245,27 @@ private class FunctionVisitor: SyntaxVisitor {
         name: fullName, kind: .variable, location: location, isEntryPoint: isEntryPoint
       )
       definitions.append(definition)
-      functionContextStack.append(fullName)
+      
+      if binding.accessorBlock != nil {
+          functionContextStack.append(fullName)
+      }
     }
     return .visitChildren
   }
 
   override func visitPost(_ node: VariableDeclSyntax) {
+    guard node.parent?.is(MemberBlockSyntax.self) == true else {
+        return
+    }
+      
     for binding in node.bindings {
       if binding.accessorBlock != nil,
-        binding.pattern.as(IdentifierPatternSyntax.self) != nil,
-        functionContextStack.last?.contains("(") != true
+        binding.pattern.as(IdentifierPatternSyntax.self) != nil
       {
         _ = functionContextStack.popLast()
       }
     }
   }
-  // --- END REFINED VARIABLE VISITOR ---
 
   override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
     let funcName = node.name.text
@@ -358,8 +381,6 @@ private class FunctionVisitor: SyntaxVisitor {
 
     return .visitChildren
   }
-
-  // MARK: - Helpers
 
   private func log(_ message: String) {
     if verbose {

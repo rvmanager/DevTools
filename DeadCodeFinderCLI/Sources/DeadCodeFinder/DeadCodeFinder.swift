@@ -4,19 +4,6 @@ import ArgumentParser
 import Foundation
 import IndexStoreDB
 
-// Helper to check if symbol kinds match between SwiftSyntax and IndexStoreDB
-private func symbolKindsMatch(_ syntaxKind: DefinitionKind, _ indexStoreKind: Any) -> Bool {
-  let kindString = String(describing: indexStoreKind)
-  switch syntaxKind {
-  case .struct: return kindString.contains("struct")
-  case .class: return kindString.contains("class")
-  case .enum: return kindString.contains("enum")
-  case .function: return kindString.contains("function")
-  case .initializer: return kindString.contains("constructor") || kindString.contains("init")
-  case .variable: return kindString.contains("variable") || kindString.contains("property")
-  }
-}
-
 struct DeadCodeFinder: ParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "A tool to find unused Swift code in a project."
@@ -37,6 +24,9 @@ struct DeadCodeFinder: ParsableCommand {
 
   @Flag(name: .shortAndLong, help: "Enable verbose logging for detailed analysis steps.")
   private var verbose: Bool = false
+
+  @Flag(help: "Dumps all symbols from SwiftSyntax and IndexStoreDB for debugging and then exits.")
+  private var dumpSymbols: Bool = false
 
   func validate() throws {
     log("Validating input paths...")
@@ -59,144 +49,75 @@ struct DeadCodeFinder: ParsableCommand {
     log("Index store path is valid: \(absoluteIndexStorePath)")
   }
 
-func run() throws {
+  func run() throws {
     let absolutePath = resolveAbsolutePath(projectPath)
     let absoluteIndexStorePath = resolveAbsolutePath(indexStorePath)
+    let excludedDirs =
+      exclude?.components(separatedBy: ",") ?? [".build", "Pods", "Carthage", "DerivedData"]
 
     log("🚀 Starting analysis of project at: \(absolutePath)")
     log("Using Index Store at: \(absoluteIndexStorePath)")
-
-    let excludedDirs =
-      exclude?.components(separatedBy: ",") ?? [".build", "Pods", "Carthage", "DerivedData"]
     log("Excluding directories: \(excludedDirs.joined(separator: ", "))")
 
-    // --- STAGE 1: DECLARATION INVENTORY (SwiftSyntax) ---
-    log("--- STAGE 1: Parsing Swift files ---")
+    // --- STAGE 1: PARSE FILES FOR ACCURATE RANGES & ENTRY POINTS ---
+    log("--- STAGE 1: Parsing Swift files with SwiftSyntax ---")
     let swiftFiles = ProjectParser.findSwiftFiles(at: absolutePath, excluding: excludedDirs)
     log("Found \(swiftFiles.count) Swift files to analyze.")
 
     let analyzer = SyntaxAnalyzer(verbose: verbose)
-    let analysisResult = analyzer.analyze(files: swiftFiles)
+    let syntaxAnalysis = analyzer.analyze(files: swiftFiles)
     log(
-      "Found \(analysisResult.definitions.count) definitions (structs, classes, functions, etc.).")
-    log("Identified \(analysisResult.entryPoints.count) potential entry points from syntax.")
+      "Parsed \(syntaxAnalysis.definitions.count) definitions from source code with accurate ranges and entry points."
+    )
 
-    // --- STAGE 2: SYMBOL HYDRATION (IndexStoreDB) ---
-    log("--- STAGE 2: Hydrating Symbols with USRs ---")
-    log("Connecting to Index Store...")
+    // --- STAGE 2: HYDRATE SYNTAX DEFINITIONS WITH CANONICAL USRs ---
+    log("--- STAGE 2: Hydrating syntax definitions with canonical USRs from IndexStore ---")
     let index = try IndexStore(storePath: absoluteIndexStorePath, verbose: verbose)
 
-    log("Hydrating \(analysisResult.definitions.count) definitions with USRs...")
-    var hydratedDefinitions = [SourceDefinition]()
-    var fileOccurrencesCache: [String: [SymbolOccurrence]] = [:]
-    
-    // Track used USRs per file to prevent incorrect re-matching
-    var usedUsrsPerFile: [String: Set<String>] = [:]
-    
-    // Arrays for detailed failure analysis
-    var definitionsRequiringFallback: [(definition: SourceDefinition, matchResult: String)] = []
+    if dumpSymbols {
+      performComprehensiveSymbolDump(
+        for: swiftFiles, with: syntaxAnalysis.definitions, index: index.store)
+      log("[DEBUG] Debug dump finished. The tool will now exit.")
+      return
+    }
 
-    for var definition in analysisResult.definitions {
-      let filePath = definition.location.filePath
-
-      if fileOccurrencesCache[filePath] == nil {
-        if verbose { log("Caching symbols for file: \(filePath)") }
-        fileOccurrencesCache[filePath] = index.store.symbolOccurrences(inFilePath: filePath)
-        usedUsrsPerFile[filePath] = Set<String>()
+    // Step 1: Create a lookup map from IndexStoreDB's canonical definitions.
+    // This provides the mapping from a location (file + line) to the definitive USR.
+    // Map: [FilePath: [LineNumber: USR]]
+    var usrLookup: [String: [Int: String]] = [:]
+    for fileURL in swiftFiles {
+      let occurrences = index.store.symbolOccurrences(inFilePath: fileURL.path)
+      let canonicalDefinitions = occurrences.filter {
+        $0.roles.contains(.definition) && $0.roles.contains(.canonical)
       }
 
-      guard let occurrencesInFile = fileOccurrencesCache[filePath] else { continue }
-      
-      var match: SymbolOccurrence?
-      var matchMethod = "FAILED"
+      for occ in canonicalDefinitions {
+        usrLookup[occ.location.path, default: [:]][occ.location.line] = occ.symbol.usr
+      }
+    }
+    log("Built a USR lookup map from IndexStore's canonical symbols.")
 
-      // Pass 1: Perfect Match (Line & Column).
-      if let perfectMatch = occurrencesInFile.first(where: {
-        $0.location.line == definition.location.line
-          && $0.location.utf8Column == definition.location.utf8Column
-          && !usedUsrsPerFile[filePath]!.contains($0.symbol.usr)
-      }) {
-        match = perfectMatch
-        matchMethod = "Pass 1 (Perfect)"
+    // Step 2: Hydrate the syntax definitions with their canonical USRs.
+    // The `syntaxDefs` are the source of truth for ranges and entry points.
+    // We enrich them with the USR from the lookup map.
+    var hydratedDefinitions: [SourceDefinition] = []
+    var unmappedCount = 0
+    for var def in syntaxAnalysis.definitions {
+      if let usr = usrLookup[def.location.filePath]?[def.location.line] {
+        def.usr = usr
+        hydratedDefinitions.append(def)
       } else {
-        // This definition failed Pass 1, track its outcome
-        
-        // Pass 2: Neighborhood Match (Name, Kind, and nearby Line).
-        if match == nil {
-          let searchNeighborhood = (definition.location.line - 2)...(definition.location.line + 2)
-          if let neighborhoodMatch = occurrencesInFile.first(where: {
-              searchNeighborhood.contains($0.location.line)
-              && $0.symbol.name.hasPrefix(definition.name)
-              && symbolKindsMatch(definition.kind, $0.symbol.kind)
-              && !usedUsrsPerFile[filePath]!.contains($0.symbol.usr)
-          }) {
-              match = neighborhoodMatch
-              matchMethod = "Pass 2 (Neighborhood)"
-          }
-        }
-        
-        // Pass 3: Line & Kind Match.
-        if match == nil {
-            if let lineMatch = occurrencesInFile.first(where: {
-                $0.location.line == definition.location.line
-                && symbolKindsMatch(definition.kind, $0.symbol.kind)
-                && !usedUsrsPerFile[filePath]!.contains($0.symbol.usr)
-            }) {
-                match = lineMatch
-                matchMethod = "Pass 3 (Line & Kind)"
-            }
-        }
-        
-        // Pass 4: Global Name & Kind Match (Ultimate Fallback).
-        if match == nil {
-            if let globalNameMatch = occurrencesInFile.first(where: {
-                $0.symbol.name.hasPrefix(definition.name)
-                && symbolKindsMatch(definition.kind, $0.symbol.kind)
-                && !usedUsrsPerFile[filePath]!.contains($0.symbol.usr)
-            }) {
-                match = globalNameMatch
-                matchMethod = "Pass 4 (Global Name)"
-            }
-        }
-        
-        definitionsRequiringFallback.append((definition, match != nil ? "OK - \(matchMethod)" : "FAIL"))
-      }
-
-      if let defOccurrence = match, !defOccurrence.symbol.usr.isEmpty {
-        definition.usr = defOccurrence.symbol.usr
-        hydratedDefinitions.append(definition)
-        usedUsrsPerFile[filePath]!.insert(defOccurrence.symbol.usr) // Mark this USR as used
+        unmappedCount += 1
+        log(
+          "Could not find a canonical USR for syntax definition: \(def.name) at \(def.location.description)"
+        )
       }
     }
 
-    let hydratedCount = hydratedDefinitions.count
-    let unhydratedCount = analysisResult.definitions.count - hydratedCount
-    
-    log("Successfully hydrated \(hydratedCount) definitions. Failed to hydrate \(unhydratedCount).")
-
-    // Detailed Failure Report
-    if verbose && !definitionsRequiringFallback.isEmpty {
-        print("\n--- Hydration Fallback Analysis ---")
-        print("The following \(definitionsRequiringFallback.count) definitions failed the 'Perfect Match' and required fallbacks:")
-        let failures = definitionsRequiringFallback.filter { $0.matchResult == "FAIL" }
-        let successes = definitionsRequiringFallback.filter { $0.matchResult != "FAIL" }
-
-        if !successes.isEmpty {
-            print("\n[SUCCESSFUL FALLBACKS - \(successes.count)]")
-            for (def, result) in successes.sorted(by: { $0.definition.location.filePath < $1.definition.location.filePath }) {
-                print("  - [\(result)] \(def.name) at \(def.location.description)")
-            }
-        }
-        
-        if !failures.isEmpty {
-            print("\n[FAILED FALLBACKS - \(failures.count)]")
-            for (def, _) in failures.sorted(by: { $0.definition.location.filePath < $1.definition.location.filePath }) {
-                 print("  - [FAIL] \(def.name) at \(def.location.description)")
-            }
-        }
-        print("---------------------------------\n")
-    }
-
+    let entryPointCount = hydratedDefinitions.filter { $0.isEntryPoint }.count
+    log(
+      "Successfully hydrated \(hydratedDefinitions.count) definitions with USRs. \(entryPointCount) marked as entry points. \(unmappedCount) definitions could not be mapped."
+    )
 
     // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
     log("--- STAGE 3: Building Call Graph ---")
@@ -205,13 +126,13 @@ func run() throws {
     // --- STAGE 4: REACHABILITY ANALYSIS ---
     log("--- STAGE 4: Analyzing for Unreachable Code ---")
     let detector = DeadCodeDetector(graph: callGraph, verbose: verbose)
-    let deadSymbols = detector.findDeadCode() // CORRECTED LINE
+    let deadSymbols = detector.findDeadCode()
 
     log("Analysis complete. Found \(deadSymbols.count) dead symbols.")
 
     // --- REPORTING ---
     report(deadSymbols)
-}
+  }
 
   private func report(_ unusedSymbols: [SourceDefinition]) {
     if unusedSymbols.isEmpty {
@@ -238,10 +159,47 @@ func run() throws {
 
   private func resolveAbsolutePath(_ path: String) -> String {
     let expandedPath = (path as NSString).expandingTildeInPath
-    if expandedPath.hasPrefix("/") {
-      return expandedPath
-    }
+    if expandedPath.hasPrefix("/") { return expandedPath }
     let currentWorkingDirectory = FileManager.default.currentDirectoryPath
     return (currentWorkingDirectory as NSString).appendingPathComponent(expandedPath)
+  }
+
+  private func performComprehensiveSymbolDump(
+    for files: [URL], with definitions: [SourceDefinition], index: IndexStoreDB
+  ) {
+    print("\n\n--- COMPREHENSIVE SYMBOL DUMP START ---\n")
+    let defsByFile = Dictionary(grouping: definitions, by: { $0.location.filePath })
+    for fileURL in files.sorted(by: { $0.path < $1.path }) {
+      let filePath = fileURL.path
+      print("========================================================================")
+      print("Filename: \(filePath)")
+      print("========================================================================")
+      print("\n[SwiftSyntax Definitions]")
+      if let defsInFile = defsByFile[filePath] {
+        for def in defsInFile.sorted(by: { $0.location.line < $1.location.line }) {
+          print(
+            "- Name: \(def.name), Kind: \(def.kind.rawValue), Location: \(def.location.line):\(def.location.column)"
+          )
+        }
+      } else {
+        print("- No definitions found.")
+      }
+
+      print("\n[IndexStoreDB Occurrences]")
+      let occurrencesInFile = index.symbolOccurrences(inFilePath: filePath)
+      if occurrencesInFile.isEmpty {
+        print("- No occurrences found.")
+      } else {
+        for occ in occurrencesInFile.sorted(by: { $0.location.line < $1.location.line }) {
+          if occ.roles.contains(.definition) {
+            print(
+              "- Symbol: \(occ.symbol.name), Kind: \(occ.symbol.kind), USR: \(occ.symbol.usr), Location: \(occ.location.line):\(occ.location.utf8Column), Roles: \(occ.roles), Properties: \(occ.relations.map { "\($0.symbol.name): \($0.roles)" }.joined(separator: ", "))"
+            )
+          }
+        }
+      }
+      print("\n")
+    }
+    print("\n--- COMPREHENSIVE SYMBOL DUMP COMPLETE ---\n")
   }
 }
