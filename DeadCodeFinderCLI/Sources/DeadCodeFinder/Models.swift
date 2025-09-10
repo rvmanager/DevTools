@@ -26,12 +26,6 @@ struct FunctionCall {
   let location: SourceLocation
 }
 
-struct CallHierarchyInfo {
-  let function: SourceDefinition
-  let highestCaller: SourceDefinition?
-  let level: Int
-}
-
 typealias FunctionDefinition = SourceDefinition
 
 struct SourceLocation {
