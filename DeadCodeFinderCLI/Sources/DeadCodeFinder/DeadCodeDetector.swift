@@ -5,10 +5,13 @@ import Foundation
 class DeadCodeDetector {
   let graph: CallGraph
   let verbose: Bool
+  private let definitions: [SourceDefinition]
 
   init(graph: CallGraph, verbose: Bool) {
     self.graph = graph
     self.verbose = verbose
+    // Create a local copy for modification
+    self.definitions = graph.definitions
   }
 
   func findDeadCode() -> [SourceDefinition] {
@@ -19,68 +22,48 @@ class DeadCodeDetector {
     log("Found \(reachableUsrs.count) reachable symbols via graph traversal.")
 
     var deadSymbols: [SourceDefinition] = []
+    var aliveSymbols: [SourceDefinition] = []
 
-    // DEBUG: Let's specifically check some of the false positives
-    let suspiciousSymbols = [
-      "RefreshSchedulingService.calculateNextRefreshDateAfterError",
-      "RefreshSchedulingService.calculatePublishingFrequency",
-      "RefreshSchedulingService.determineActivityLevel",
-    ]
-
-    // A symbol is dead if it's not an entry point itself and it was not found in the reachability traversal.
-    for definition in graph.definitions {
-      guard let usr = definition.usr else {
-        log("[DEBUG] Definition without USR: \(definition.name)")
-        continue
-      }
+    // Initial Pass: A symbol is dead if it's not an entry point and not in the reachable set.
+    for definition in definitions {
+      guard let usr = definition.usr else { continue }
 
       let isReachable = reachableUsrs.contains(usr)
       let isEntryPoint = definition.isEntryPoint
-      let isDead = !isEntryPoint && !isReachable
 
-      // Debug specific symbols
-      if suspiciousSymbols.contains(where: { definition.name.contains($0) }) {
-        log("[DEBUG] Suspicious symbol analysis:")
-        log("  Name: \(definition.name)")
-        log("  USR: \(usr)")
-        log("  Is Entry Point: \(isEntryPoint)")
-        log("  Is Reachable: \(isReachable)")
-        log("  Will be marked dead: \(isDead)")
-
-        // Check what calls this symbol
-        if let callers = graph.reverseAdjacencyList[usr] {
-          log("  Called by \(callers.count) symbols:")
-          for callerUsr in callers {
-            if let callerDef = graph.usrToDefinition[callerUsr] {
-              log("    - \(callerDef.name)")
-            } else {
-              log("    - Unknown caller with USR: \(callerUsr)")
-            }
-          }
-        } else {
-          log("  Called by: NONE")
-        }
-
-        // Check what this symbol calls
-        if let callees = graph.adjacencyList[usr] {
-          log("  Calls \(callees.count) symbols:")
-          for calleeUsr in callees {
-            if let calleeDef = graph.usrToDefinition[calleeUsr] {
-              log("    - \(calleeDef.name)")
-            } else {
-              log("    - Unknown callee with USR: \(calleeUsr)")
-            }
-          }
-        } else {
-          log("  Calls: NONE")
-        }
+      if isEntryPoint || isReachable {
+        aliveSymbols.append(definition)
+      } else {
+        deadSymbols.append(definition)
       }
+    }
 
-      if isDead {
+    // Post-Processing Pass: Implement the SwiftUI View heuristic.
+    let rescuedSymbols = rescueSwiftUIViewMembers(
+      deadSymbols: deadSymbols,
+      aliveSymbols: aliveSymbols
+    )
+
+    if !rescuedSymbols.isEmpty {
+      log("Rescued \(rescuedSymbols.count) symbols based on SwiftUI View heuristic.")
+      // Remove rescued symbols from the dead list
+      let rescuedUsrs = Set(rescuedSymbols.compactMap { $0.usr })
+      deadSymbols.removeAll { definition in
+        guard let usr = definition.usr else { return false }
+        return rescuedUsrs.contains(usr)
+      }
+      aliveSymbols.append(contentsOf: rescuedSymbols)
+    }
+
+    // Final Logging
+    for definition in definitions {
+      guard let usr = definition.usr else { continue }
+      let isAlive = aliveSymbols.contains { $0.usr == usr }
+
+      if !isAlive {
         if verbose {
           log("[DEAD] Found dead symbol: \(definition.name) at \(definition.location.description)")
         }
-        deadSymbols.append(definition)
       } else if verbose {
         if definition.isEntryPoint {
           log("[ALIVE] Symbol is alive (entry point): \(definition.name)")
@@ -93,11 +76,51 @@ class DeadCodeDetector {
     return deadSymbols
   }
 
+  /// A heuristic to rescue private methods of reachable SwiftUI Views.
+  /// In SwiftUI, methods are often called implicitly from the `body` via closures (e.g., `Button(action: myPrivateMethod)`),
+  /// and IndexStoreDB may not register these as formal call references.
+  private func rescueSwiftUIViewMembers(
+    deadSymbols: [SourceDefinition], aliveSymbols: [SourceDefinition]
+  ) -> [SourceDefinition] {
+    var rescued: [SourceDefinition] = []
+
+    // Create a lookup set of all reachable type USRs for efficient checking.
+    let aliveTypeUsrs = Set(
+      aliveSymbols.filter { $0.kind == .struct || $0.kind == .class }.compactMap { $0.usr })
+
+    for deadSymbol in deadSymbols {
+      // We only care about private instance methods/vars for this heuristic.
+      guard deadSymbol.kind == .function || deadSymbol.kind == .variable else { continue }
+
+      // Extract the parent type's name from the symbol's full name (e.g., "MyView.myFunction" -> "MyView").
+      let components = deadSymbol.name.components(separatedBy: ".")
+      guard components.count > 1 else { continue }
+      let parentTypeName = components.dropLast().joined(separator: ".")
+
+      // Find the definition of the parent type.
+      guard let parentType = definitions.first(where: { $0.name == parentTypeName }) else {
+        continue
+      }
+
+      // If the parent type is in the set of reachable types, we rescue this private method.
+      if let parentUsr = parentType.usr, aliveTypeUsrs.contains(parentUsr) {
+        if verbose {
+          log(
+            "[HEURISTIC] Rescuing '\(deadSymbol.name)' because its parent View '\(parentTypeName)' is alive."
+          )
+        }
+        rescued.append(deadSymbol)
+      }
+    }
+
+    return rescued
+  }
+
   private func findReachableSymbols() -> Set<String> {
     var reachable = Set<String>()
 
     // The initial queue is all USRs of definitions marked as entry points by SwiftSyntax.
-    var queue = graph.definitions.filter { $0.isEntryPoint }.compactMap { $0.usr }
+    var queue = definitions.filter { $0.isEntryPoint }.compactMap { $0.usr }
 
     log("Starting reachability analysis from \(queue.count) entry points...")
 
