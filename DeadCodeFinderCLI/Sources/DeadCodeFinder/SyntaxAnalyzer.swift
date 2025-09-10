@@ -143,18 +143,20 @@ private class FunctionVisitor: SyntaxVisitor {
     )
     definitions.append(definition)
 
-    if isEntryPoint && (node.inheritanceClause?.description.contains("Decodable") ?? false) {
+    if isEntryPoint {
       for member in node.memberBlock.members {
-        if let varDecl = member.decl.as(VariableDeclSyntax.self) {
-          for binding in varDecl.bindings {
-            if let pattern = binding.pattern.as(IdentifierPatternSyntax.self) {
-              let propName = pattern.identifier.text
-              let propFullName = fullName + "." + propName
-              let propLocation = sourceLocation(for: pattern.identifier)
-              let propDef = SourceDefinition(
-                name: propFullName, kind: .variable, location: propLocation, isEntryPoint: true)
-              definitions.append(propDef)
-            }
+        if let initDecl = member.decl.as(InitializerDeclSyntax.self) {
+          let initFullName = createUniqueName(baseName: "init", node: initDecl)
+          let initLocation = sourceLocation(for: initDecl)
+          let initDef = SourceDefinition(
+            name: initFullName,
+            kind: .initializer,
+            location: initLocation,
+            isEntryPoint: true
+          )
+          definitions.append(initDef)
+          if verbose {
+            log("Marking '\(initFullName)' as entry point (part of entry point struct)")
           }
         }
       }
@@ -327,7 +329,10 @@ private class FunctionVisitor: SyntaxVisitor {
     }
 
     let definition = SourceDefinition(
-      name: fullName, kind: .initializer, location: location, isEntryPoint: isEntryPoint
+      name: fullName,
+      kind: .initializer,
+      location: location,
+      isEntryPoint: isEntryPoint
     )
     definitions.append(definition)
     enterScope(name: "init", node: node)
@@ -483,6 +488,14 @@ private class FunctionVisitor: SyntaxVisitor {
 
   private func checkForEntryPoint(node: FunctionDeclSyntax, name: String, fullName: String) -> Bool
   {
+    let representableMethods: Set<String> = [
+      "makeUIView", "updateUIView", "makeNSView", "updateNSView", "makeCoordinator",
+    ]
+    if representableMethods.contains(name) {
+      if verbose { log("... \(fullName) is entry point (ViewRepresentable method)") }
+      return true
+    }
+
     if name == "main", let parent = node.parent?.parent?.parent,
       let decl = parent.asProtocol(WithAttributesSyntax.self)
     {

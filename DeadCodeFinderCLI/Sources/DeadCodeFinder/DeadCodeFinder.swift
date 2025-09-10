@@ -9,6 +9,13 @@ struct DeadCodeFinder: ParsableCommand {
     abstract: "A tool to find unused Swift code in a project."
   )
 
+  // A new struct to hold rich symbol information from IndexStoreDB.
+  private struct SymbolInfo {
+    let usr: String
+    let name: String
+    let kind: IndexSymbolKind
+  }
+
   @Argument(help: "The root path of the Swift project to analyze.")
   private var projectPath: String
 
@@ -85,11 +92,9 @@ struct DeadCodeFinder: ParsableCommand {
     }
 
     // Step 1: Create a lookup map from IndexStoreDB's canonical definitions.
-    // This provides the mapping from a location (file + line) to the definitive USR.
-    // Map: [FilePath: [LineNumber: USR]]
-    var usrLookup: [String: [Int: String]] = [:]
+    // This provides the mapping from a location (file + line) to a list of all symbols on that line.
+    var usrLookup: [String: [Int: [SymbolInfo]]] = [:]
     var indexSymbolsByFile: [String: [(line: Int, symbol: String, usr: String)]] = [:]
-    var nameBasedLookup: [String: [String: String]] = [:]
 
     for fileURL in swiftFiles {
       let occurrences = index.store.symbolOccurrences(inFilePath: fileURL.path)
@@ -98,18 +103,18 @@ struct DeadCodeFinder: ParsableCommand {
       }
 
       for occ in canonicalDefinitions {
-        usrLookup[occ.location.path, default: [:]][occ.location.line] = occ.symbol.usr
+        // Create the rich SymbolInfo object.
+        let info = SymbolInfo(usr: occ.symbol.usr, name: occ.symbol.name, kind: occ.symbol.kind)
+        // Append all symbols for a given line, rather than overwriting.
+        usrLookup[occ.location.path, default: [:]][occ.location.line, default: []].append(info)
+
+        // Keep the old debug structure for comparison if needed.
         indexSymbolsByFile[occ.location.path, default: []].append(
           (
             line: occ.location.line,
             symbol: occ.symbol.name,
             usr: occ.symbol.usr
           ))
-
-        // Add this block
-        let symbolName = occ.symbol.name
-        let cleanName = symbolName.components(separatedBy: "(").first ?? symbolName
-        nameBasedLookup[occ.location.path, default: [:]][cleanName] = occ.symbol.usr
       }
     }
     log("Built a USR lookup map from IndexStore's canonical symbols.")
@@ -125,27 +130,15 @@ struct DeadCodeFinder: ParsableCommand {
     }
 
     // Step 2: Hydrate the syntax definitions with their canonical USRs.
-    // The `syntaxDefs` are the source of truth for ranges and entry points.
-    // We enrich them with the USR from the lookup map.
+    // We enrich them with the USR from the lookup map using our intelligent matching function.
     var hydratedDefinitions: [SourceDefinition] = []
     var unmappedCount = 0
-    var exactMatches = 0
-    var fuzzyMatches = 0
 
     for var def in syntaxAnalysis.definitions {
-      if let usr = findUSRForDefinition(
-        name: def.name, location: def.location, usrLookup: usrLookup,
-        nameBasedLookup: nameBasedLookup, debugUSR: debugUSR)
-      {
+      // Replace the old, simple lookup with the new, scoring-based matcher.
+      if let usr = findBestMatchingUSR(for: def, in: usrLookup) {
         def.usr = usr
         hydratedDefinitions.append(def)
-
-        // Track match type for statistics
-        if usrLookup[def.location.filePath]?[def.location.line] != nil {
-          exactMatches += 1
-        } else {
-          fuzzyMatches += 1
-        }
       } else {
         unmappedCount += 1
         if debugUSR {
@@ -169,13 +162,6 @@ struct DeadCodeFinder: ParsableCommand {
       "Successfully hydrated \(hydratedDefinitions.count) definitions with USRs. \(entryPointCount) marked as entry points. \(unmappedCount) definitions could not be mapped."
     )
 
-    if debugUSR {
-      log("USR Matching Statistics:")
-      log("  Exact matches: \(exactMatches)")
-      log("  Fuzzy matches: \(fuzzyMatches)")
-      log("  Unmapped: \(unmappedCount)")
-    }
-
     // --- STAGE 3: ACCURATE GRAPH CONSTRUCTION ---
     log("--- STAGE 3: Building Call Graph ---")
     let callGraph = CallGraph(definitions: hydratedDefinitions, index: index, verbose: verbose)
@@ -188,79 +174,106 @@ struct DeadCodeFinder: ParsableCommand {
     log("Analysis complete. Found \(deadSymbols.count) dead symbols.")
 
     // --- REPORTING ---
-    // MODIFICATION: Call the new dump function to print every reference.
     callGraph.dumpAllProcessedReferences()
-    
+
     report(deadSymbols, callGraph: callGraph)
   }
 
-  private func findUSRForDefinition(
-    name: String, location: SourceLocation, usrLookup: [String: [Int: String]],
-    nameBasedLookup: [String: [String: String]], debugUSR: Bool
+  /// Finds the best-matching canonical USR for a SwiftSyntax definition by comparing it against
+  /// a list of candidates from IndexStoreDB and scoring them based on kind and name.
+  private func findBestMatchingUSR(
+    for def: SourceDefinition,
+    in usrLookup: [String: [Int: [SymbolInfo]]]
   ) -> String? {
-    let filePath = location.filePath
+    let filePath = def.location.filePath
 
-    // Try exact match first
-    if let usr = usrLookup[filePath]?[location.line] {
+    // --- Phase 1: Try for a high-quality match on the exact line ---
+    if let candidates = usrLookup[filePath]?[def.location.line] {
+      if let bestMatch = scoreAndSelectBestCandidate(for: def, from: candidates) {
+        if debugUSR {
+          log("✅ Exact line match for \(def.name) with score \(bestMatch.score)")
+        }
+        return bestMatch.usr
+      }
+    }
+
+    // --- Phase 2: Fallback to fuzzy line matching if no exact match was found ---
+    if debugUSR {
+      log("No exact line match for \(def.name), trying fuzzy search...")
+    }
+
+    // Collect all candidates from a wider range of lines to find the best possible fuzzy match.
+    var fuzzyCandidates: [SymbolInfo] = []
+    let searchRange = (def.location.line - 2)...(def.location.endLine + 2)
+    for line in searchRange {
+      if let candidatesOnLine = usrLookup[filePath]?[line] {
+        fuzzyCandidates.append(contentsOf: candidatesOnLine)
+      }
+    }
+
+    if !fuzzyCandidates.isEmpty,
+      let bestMatch = scoreAndSelectBestCandidate(for: def, from: fuzzyCandidates)
+    {
       if debugUSR {
-        log("✅ Exact USR match for \(name) at line \(location.line)")
+        log("✅ Fuzzy match for \(def.name) with score \(bestMatch.score)")
       }
-      return usr
-    }
-
-    // Try nearby lines (±5 lines for better coverage)
-    for offset in 1...5 {
-      // Try lines after
-      if let usr = usrLookup[filePath]?[location.line + offset] {
-        if debugUSR {
-          log(
-            "✅ Fuzzy USR match for \(name) at line \(location.line + offset) (offset +\(offset) from SwiftSyntax line \(location.line))"
-          )
-        }
-        return usr
-      }
-
-      // Try lines before
-      let beforeLine = location.line - offset
-      if beforeLine > 0, let usr = usrLookup[filePath]?[beforeLine] {
-        if debugUSR {
-          log(
-            "✅ Fuzzy USR match for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(location.line))"
-          )
-        }
-        return usr
-      }
-    }
-
-    // For structs/classes/enums, also try looking for any USR in the declaration range
-    if location.endLine > location.line {
-      for line in location.line...min(location.line + 20, location.endLine) {
-        if let usr = usrLookup[filePath]?[line] {
-          if debugUSR {
-            log(
-              "✅ Range USR match for \(name) at line \(line) (SwiftSyntax range: \(location.line)-\(location.endLine))"
-            )
-          }
-          return usr
-        }
-      }
-    }
-
-    // Try name-based matching (ignoring line numbers completely)
-    if let nameMap = nameBasedLookup[filePath] {
-      // Extract the method name from the full name (e.g., "VideoPlayerView.setupPlayer" -> "setupPlayer")
-      let methodName = name.components(separatedBy: ".").last ?? name
-
-      // Try exact method name match
-      if let usr = nameMap[methodName] {
-        if debugUSR {
-          log("✅ Name-based USR match for \(name) using method name '\(methodName)'")
-        }
-        return usr
-      }
+      return bestMatch.usr
     }
 
     return nil
+  }
+
+  /// Shared scoring logic for selecting the best symbol candidate.
+  private func scoreAndSelectBestCandidate(
+    for def: SourceDefinition,
+    from candidates: [SymbolInfo]
+  ) -> (usr: String, score: Int)? {
+    var bestMatch: (usr: String, score: Int)?
+
+    for candidate in candidates {
+      var score = 0
+
+      // 1. PRIMARY CRITERION: Symbol Kind Match.
+      if isKindMatch(syntaxKind: def.kind, indexKind: candidate.kind) {
+        score += 1000
+      } else {
+        continue
+      }
+
+      // 2. SECONDARY CRITERION: Name Match.
+      let syntaxBaseName = (def.name.components(separatedBy: ".").last ?? def.name)
+      let indexBaseName = (candidate.name.components(separatedBy: "(").first ?? candidate.name)
+      if syntaxBaseName == indexBaseName {
+        score += 100
+      }
+
+      // 3. TIE-BREAKER: Favor shorter USRs.
+      score -= candidate.usr.count
+
+      if bestMatch == nil || score > bestMatch!.score {
+        bestMatch = (usr: candidate.usr, score: score)
+      }
+    }
+    return bestMatch
+  }
+
+  /// Helper to bridge between the tool's internal DefinitionKind and IndexStoreDB's Symbol.Kind.
+  private func isKindMatch(syntaxKind: DefinitionKind, indexKind: IndexSymbolKind) -> Bool {
+    switch syntaxKind {
+    case .function:
+      return indexKind == .function || indexKind == .instanceMethod || indexKind == .staticMethod
+    case .initializer:
+      return indexKind == .constructor
+    case .variable:
+      return indexKind == .variable || indexKind == .instanceProperty
+        || indexKind == .staticProperty
+    case .struct:
+      return indexKind == .struct
+    case .class:
+      return indexKind == .class
+    case .enum:
+      return indexKind == .enum
+    }
   }
 
   private func report(_ unusedSymbols: [SourceDefinition], callGraph: CallGraph) {
@@ -306,7 +319,6 @@ struct DeadCodeFinder: ParsableCommand {
       print("\n[SwiftSyntax Definitions]")
       if let defsInFile = defsByFile[filePath] {
         for def in defsInFile.sorted(by: { $0.location.line < $1.location.line }) {
-          // MODIFICATION: Added endLine and endColumn to the output string.
           print(
             "- Name: \(def.name), Kind: \(def.kind.rawValue), Location: \(def.location.line):\(def.location.column)-\(def.location.endLine):\(def.location.endColumn)"
           )
@@ -322,7 +334,6 @@ struct DeadCodeFinder: ParsableCommand {
       } else {
         for occ in occurrencesInFile.sorted(by: { $0.location.line < $1.location.line }) {
           if occ.roles.contains(.definition) {
-            // NO CHANGE: IndexStoreDB.SourceLocation only provides a start point, not a range.
             print(
               "- Symbol: \(occ.symbol.name), Kind: \(occ.symbol.kind), USR: \(occ.symbol.usr), Location: \(occ.location.line):\(occ.location.utf8Column), Roles: \(occ.roles), Properties: \(occ.relations.map { "\($0.symbol.name): \($0.roles)" }.joined(separator: ", "))"
             )
