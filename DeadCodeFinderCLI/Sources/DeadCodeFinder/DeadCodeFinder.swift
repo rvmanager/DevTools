@@ -16,6 +16,33 @@ struct DeadCodeFinder: ParsableCommand {
     let kind: IndexSymbolKind
   }
 
+  private struct ReportItem: Comparable {
+    let number: String
+    let description: String
+    private let components: [Int]
+
+    init(number: String, symbol: SourceDefinition) {
+      self.number = number
+      // The leading space aligns the output nicely
+      self.description =
+        " \(number) \(symbol.location.description) -> \(symbol.name) [\(symbol.kind.rawValue)]"
+      self.components = number.split(separator: ".").compactMap { Int($0) }
+    }
+
+    static func < (lhs: ReportItem, rhs: ReportItem) -> Bool {
+      for (l, r) in zip(lhs.components, rhs.components) {
+        if l != r {
+          return l < r
+        }
+      }
+      return lhs.components.count < rhs.components.count
+    }
+
+    static func == (lhs: ReportItem, rhs: ReportItem) -> Bool {
+      return lhs.components == rhs.components
+    }
+  }
+
   @Argument(help: "The root path of the Swift project to analyze.")
   private var projectPath: String
 
@@ -279,15 +306,111 @@ struct DeadCodeFinder: ParsableCommand {
   private func report(_ unusedSymbols: [SourceDefinition], callGraph: CallGraph) {
     if unusedSymbols.isEmpty {
       print("\n✅ No unused symbols found. Excellent!")
-    } else {
-      print("\n❌ Found \(unusedSymbols.count) potentially unused symbols:")
-      let sortedSymbols = unusedSymbols.sorted {
-        $0.location.filePath < $1.location.filePath
-          || ($0.location.filePath == $1.location.filePath && $0.location.line < $1.location.line)
+      return
+    }
+
+    print("\n❌ Found \(unusedSymbols.count) potentially unused symbols:")
+
+    // 1. Setup data structures for dead symbols only
+    // CORRECTED LINE: Added explicit type annotation to help the compiler.
+    let unusedUsrToDefinition = Dictionary(
+      unusedSymbols.compactMap { def -> (String, SourceDefinition)? in
+        guard let usr = def.usr else { return nil }
+        return (usr, def)
+      }, uniquingKeysWith: { (first, _) in first })
+    let unusedUsrs = Set(unusedUsrToDefinition.keys)
+
+    var deadDependencies: [String: Set<String>] = [:]
+    var deadReferrers: [String: Set<String>] = [:]
+
+    for unusedUsr in unusedUsrs {
+      if let dependencies = callGraph.adjacencyList[unusedUsr] {
+        deadDependencies[unusedUsr] = dependencies.filter { unusedUsrs.contains($0) }
       }
-      for symbol in sortedSymbols {
-        print("  - \(symbol.location.description) -> \(symbol.name) [\(symbol.kind.rawValue)]")
+      if let referrers = callGraph.reverseAdjacencyList[unusedUsr] {
+        deadReferrers[unusedUsr] = referrers.filter { unusedUsrs.contains($0) }
       }
+    }
+
+    // 2. Find connected components (islands)
+    var visitedUsrs = Set<String>()
+    var islands: [[SourceDefinition]] = []
+    for symbol in unusedSymbols {
+      guard let usr = symbol.usr, !visitedUsrs.contains(usr) else { continue }
+
+      var currentIslandUsrs = Set<String>()
+      var queue = [usr]
+      visitedUsrs.insert(usr)
+
+      while !queue.isEmpty {
+        let currentUsr = queue.removeFirst()
+        currentIslandUsrs.insert(currentUsr)
+
+        let neighbors = (deadDependencies[currentUsr] ?? Set()).union(
+          deadReferrers[currentUsr] ?? Set())
+        for neighborUsr in neighbors where !visitedUsrs.contains(neighborUsr) {
+          visitedUsrs.insert(neighborUsr)
+          queue.append(neighborUsr)
+        }
+      }
+      islands.append(currentIslandUsrs.compactMap { unusedUsrToDefinition[$0] })
+    }
+
+    // 3. Process each island to generate numbered report items
+    var allReportItems: [ReportItem] = []
+    for (islandIndex, island) in islands.enumerated() {
+      let islandUsrs = Set(island.compactMap { $0.usr })
+      var numberMap: [String: String] = [:]
+
+      // Find leaves (symbols in the island not depending on anything else *in the island*)
+      let leaves = island.filter {
+        guard let usr = $0.usr else { return true }
+        let dependencies = deadDependencies[usr] ?? Set()
+        return dependencies.isDisjoint(with: islandUsrs)
+      }.sorted { $0.name < $1.name }
+
+      // Recursive function to traverse upwards from leaves and number referrers
+      func numberReferrers(from usr: String, baseNumber: String) {
+        guard
+          let referrers = deadReferrers[usr]?.sorted(by: { (usrA, usrB) -> Bool in
+            (unusedUsrToDefinition[usrA]?.name ?? "") < (unusedUsrToDefinition[usrB]?.name ?? "")
+          })
+        else { return }
+
+        for (referrerIndex, referrerUsr) in referrers.enumerated() {
+          // If a symbol refers to multiple items, it gets numbered by the first traversal
+          if numberMap[referrerUsr] != nil { continue }
+
+          let newNumber = "\(baseNumber).\(referrerIndex + 1)"
+          numberMap[referrerUsr] = newNumber
+
+          // Recurse upwards to the next level of referrers
+          numberReferrers(from: referrerUsr, baseNumber: newNumber)
+        }
+      }
+
+      // Start the numbering process from the leaves of the island
+      for (leafIndex, leaf) in leaves.enumerated() {
+        guard let leafUsr = leaf.usr, numberMap[leafUsr] == nil else { continue }
+
+        let number = "\(islandIndex + 1).\(leafIndex)"
+        numberMap[leafUsr] = number
+        numberReferrers(from: leafUsr, baseNumber: number)
+      }
+
+      // Generate ReportItem objects for every symbol in the island
+      for symbol in island {
+        guard let usr = symbol.usr else { continue }
+        // If a symbol wasn't numbered (e.g., part of a cycle), assign a base island number
+        let number = numberMap[usr] ?? "\(islandIndex + 1)"
+        allReportItems.append(ReportItem(number: number, symbol: symbol))
+      }
+    }
+
+    // 4. Sort and print the final, formatted report
+    allReportItems.sort()
+    for item in allReportItems {
+      print(item.description)
     }
   }
 
