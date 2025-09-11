@@ -1,36 +1,89 @@
 // Sources/DeadCodeFinder/DeadCodeDetector.swift
 
 import Foundation
+import IndexStoreDB
 
 class DeadCodeDetector {
   let graph: CallGraph
+  let index: IndexStore
   let verbose: Bool
+  let respectPublicApi: Bool
   private let definitions: [SourceDefinition]
 
-  init(graph: CallGraph, verbose: Bool) {
+  init(graph: CallGraph, index: IndexStore, verbose: Bool, respectPublicApi: Bool) {
     self.graph = graph
+    self.index = index
     self.verbose = verbose
-    // Create a local copy for modification
+    self.respectPublicApi = respectPublicApi
     self.definitions = graph.definitions
   }
 
   func findDeadCode() -> [SourceDefinition] {
     log("Starting dead code detection...")
 
-    // First, identify all symbols that are reachable from known entry points.
-    let reachableUsrs = findReachableSymbols()
-    log("Found \(reachableUsrs.count) reachable symbols via graph traversal.")
+    // STAGE 1: Find all unused stored properties.
+    let unusedPropertyUsrs = findUnusedPropertyUsrs()
+    log("Found \(unusedPropertyUsrs.count) unused properties.")
+
+    // STAGE 2: Create a mutable copy of the graph to prune.
+    var prunedAdjacencyList = graph.adjacencyList
+    let propertyDefs = definitions.filter { $0.kind == .property }
+
+    for propertyDef in propertyDefs {
+      guard let propertyUsr = propertyDef.usr,
+        unusedPropertyUsrs.contains(propertyUsr),
+        let propertyTypeName = propertyDef.typeName,
+        let containerUsr = findContainerUsr(for: propertyDef)
+      else { continue }
+
+      // --- Configurable Pruning Logic ---
+      var isPrunable = true
+      if respectPublicApi {
+        // If the safety flag is on, only prune private/fileprivate
+        if propertyDef.accessLevel != .private && propertyDef.accessLevel != .fileprivate {
+          isPrunable = false
+        }
+      }
+
+      guard isPrunable else {
+        if verbose {
+          log(
+            "[PRUNING] SKIPPED pruning for unreferenced public/internal property: '\(propertyDef.name)' (Safe API mode enabled)"
+          )
+        }
+        continue
+      }
+
+      // Find the USR of the property's type (e.g., UnusedTest2)
+      guard
+        let propertyTypeUsr = graph.usrToDefinition.first(where: {
+          $0.value.name == propertyTypeName
+        })?.key
+      else { continue }
+
+      // This is the invalid edge: Container -> PropertyType. Remove it.
+      prunedAdjacencyList[containerUsr]?.remove(propertyTypeUsr)
+
+      if verbose {
+        let containerName = graph.usrToDefinition[containerUsr]?.name ?? "???"
+        log(
+          "[PRUNING] Removing edge from '\(containerName)' to '\(propertyTypeName)' due to unused property '\(propertyDef.name)'."
+        )
+      }
+    }
+
+    // STAGE 3: Run reachability analysis on the pruned graph.
+    let finalReachableUsrs = findReachableSymbols(using: prunedAdjacencyList)
+    log("Found \(finalReachableUsrs.count) reachable symbols after pruning.")
 
     var deadSymbols: [SourceDefinition] = []
     var aliveSymbols: [SourceDefinition] = []
 
-    // Initial Pass: A symbol is dead if it's not an entry point and not in the reachable set.
+    // Pass 1: A symbol is dead if it's not an entry point and not in the final reachable set.
     for definition in definitions {
       guard let usr = definition.usr else { continue }
-
-      let isReachable = reachableUsrs.contains(usr)
+      let isReachable = finalReachableUsrs.contains(usr)
       let isEntryPoint = definition.isEntryPoint
-
       if isEntryPoint || isReachable {
         aliveSymbols.append(definition)
       } else {
@@ -38,15 +91,13 @@ class DeadCodeDetector {
       }
     }
 
-    // Post-Processing Pass: Implement the SwiftUI View heuristic.
+    // Pass 2: Apply heuristics to rescue symbols that are implicitly used.
     let rescuedSymbols = rescueSwiftUIViewMembers(
       deadSymbols: deadSymbols,
       aliveSymbols: aliveSymbols
     )
-
     if !rescuedSymbols.isEmpty {
       log("Rescued \(rescuedSymbols.count) symbols based on SwiftUI View heuristic.")
-      // Remove rescued symbols from the dead list
       let rescuedUsrs = Set(rescuedSymbols.compactMap { $0.usr })
       deadSymbols.removeAll { definition in
         guard let usr = definition.usr else { return false }
@@ -58,51 +109,31 @@ class DeadCodeDetector {
     // Final Logging
     for definition in definitions {
       guard let usr = definition.usr else { continue }
-      let isAlive = aliveSymbols.contains { $0.usr == usr }
-
+      let isAlive = !deadSymbols.contains(where: { $0.usr == usr })
       if !isAlive {
         if verbose {
           log("[DEAD] Found dead symbol: \(definition.name) at \(definition.location.description)")
         }
-      } else if verbose {
-        if definition.isEntryPoint {
-          log("[ALIVE] Symbol is alive (entry point): \(definition.name)")
-        } else {
-          log("[ALIVE] Symbol is alive (reachable): \(definition.name)")
-        }
       }
     }
-
     return deadSymbols
   }
 
   /// A heuristic to rescue private methods of reachable SwiftUI Views.
-  /// In SwiftUI, methods are often called implicitly from the `body` via closures (e.g., `Button(action: myPrivateMethod)`),
-  /// and IndexStoreDB may not register these as formal call references.
   private func rescueSwiftUIViewMembers(
     deadSymbols: [SourceDefinition], aliveSymbols: [SourceDefinition]
   ) -> [SourceDefinition] {
     var rescued: [SourceDefinition] = []
-
-    // Create a lookup set of all reachable type USRs for efficient checking.
     let aliveTypeUsrs = Set(
       aliveSymbols.filter { $0.kind == .struct || $0.kind == .class }.compactMap { $0.usr })
-
     for deadSymbol in deadSymbols {
-      // We only care about private instance methods/vars for this heuristic.
       guard deadSymbol.kind == .function || deadSymbol.kind == .variable else { continue }
-
-      // Extract the parent type's name from the symbol's full name (e.g., "MyView.myFunction" -> "MyView").
       let components = deadSymbol.name.components(separatedBy: ".")
       guard components.count > 1 else { continue }
       let parentTypeName = components.dropLast().joined(separator: ".")
-
-      // Find the definition of the parent type.
       guard let parentType = definitions.first(where: { $0.name == parentTypeName }) else {
         continue
       }
-
-      // If the parent type is in the set of reachable types, we rescue this private method.
       if let parentUsr = parentType.usr, aliveTypeUsrs.contains(parentUsr) {
         if verbose {
           log(
@@ -112,40 +143,26 @@ class DeadCodeDetector {
         rescued.append(deadSymbol)
       }
     }
-
     return rescued
   }
 
-  private func findReachableSymbols() -> Set<String> {
+  /// Performs a breadth-first search on the call graph to find all reachable symbols.
+  private func findReachableSymbols(using adjacencyList: [String: Set<String>]? = nil) -> Set<
+    String
+  > {
+    let graphToUse = adjacencyList ?? self.graph.adjacencyList
     var reachable = Set<String>()
-
-    // The initial queue is all USRs of definitions marked as entry points by SwiftSyntax.
     var queue = definitions.filter { $0.isEntryPoint }.compactMap { $0.usr }
-
     log("Starting reachability analysis from \(queue.count) entry points...")
-
-    // Add all entry points to the reachable set initially.
     for usr in queue {
-      if verbose, let def = graph.usrToDefinition[usr] {
-        log(" -> Adding entry point to queue: \(def.name)")
-      }
       reachable.insert(usr)
     }
-
-    // Perform a classic Breadth-First Search (BFS) to find all reachable nodes.
     var head = 0
     while head < queue.count {
       let currentUsr = queue[head]
       head += 1
-
-      if verbose, let def = graph.usrToDefinition[currentUsr] {
-        log("  - Traversing from: \(def.name)")
-      }
-
-      // Find all symbols that are called *by* the current symbol.
-      if let callees = graph.adjacencyList[currentUsr] {
+      if let callees = graphToUse[currentUsr] {
         for calleeUsr in callees {
-          // If we haven't seen this callee before, add it to the reachable set and the queue to visit later.
           if !reachable.contains(calleeUsr) {
             reachable.insert(calleeUsr)
             queue.append(calleeUsr)
@@ -156,8 +173,32 @@ class DeadCodeDetector {
         }
       }
     }
-
     return reachable
+  }
+
+  /// Finds all stored properties that are defined but never referenced.
+  private func findUnusedPropertyUsrs() -> Set<String> {
+    var unused = Set<String>()
+    let propertyDefinitions = definitions.filter { $0.kind == .property }
+    for propDef in propertyDefinitions {
+      guard let usr = propDef.usr else { continue }
+      let occurrences = index.store.occurrences(ofUSR: usr, roles: .reference)
+      if occurrences.isEmpty {
+        if verbose {
+          log("[PROPERTY] Found unused property: \(propDef.name)")
+        }
+        unused.insert(usr)
+      }
+    }
+    return unused
+  }
+
+  /// Finds the USR of the type that contains a given property definition.
+  private func findContainerUsr(for propertyDef: SourceDefinition) -> String? {
+    let components = propertyDef.name.components(separatedBy: ".")
+    guard components.count > 1 else { return nil }
+    let containerTypeName = components.dropLast().joined(separator: ".")
+    return graph.usrToDefinition.first(where: { $0.value.name == containerTypeName })?.key
   }
 
   private func log(_ message: String) {

@@ -2,6 +2,14 @@
 
 import Foundation
 
+enum AccessLevel: String {
+  case `private`
+  case `fileprivate`
+  case `internal`
+  case `public`
+  case `open`
+}
+
 enum DefinitionKind: String {
   case `struct`
   case `class`
@@ -9,6 +17,7 @@ enum DefinitionKind: String {
   case function
   case initializer
   case variable
+  case property
 }
 
 struct SourceDefinition {
@@ -18,6 +27,8 @@ struct SourceDefinition {
   let location: SourceLocation
   var usr: String?
   var isEntryPoint: Bool
+  var typeName: String?
+  var accessLevel: AccessLevel?
 }
 
 struct FunctionCall {

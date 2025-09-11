@@ -65,6 +65,13 @@ struct DeadCodeFinder: ParsableCommand {
   @Flag(help: "Enable detailed USR matching debug information.")
   private var debugUSR: Bool = false
 
+  @Flag(
+    name: .long,
+    help:
+      "Prevents the tool from flagging unreferenced public and internal properties as dead code. Use this when analyzing a library or framework."
+  )
+  private var respectPublicApi: Bool = false
+
   func validate() throws {
     log("Validating input paths...")
     let absolutePath = resolveAbsolutePath(projectPath)
@@ -195,14 +202,19 @@ struct DeadCodeFinder: ParsableCommand {
 
     // --- STAGE 4: REACHABILITY ANALYSIS ---
     log("--- STAGE 4: Analyzing for Unreachable Code ---")
-    let detector = DeadCodeDetector(graph: callGraph, verbose: verbose)
+    // MODIFIED: Pass the new flag and index store to the detector
+    let detector = DeadCodeDetector(
+      graph: callGraph,
+      index: index,
+      verbose: verbose,
+      respectPublicApi: respectPublicApi
+    )
     let deadSymbols = detector.findDeadCode()
 
     log("Analysis complete. Found \(deadSymbols.count) dead symbols.")
 
     // --- REPORTING ---
     callGraph.dumpAllProcessedReferences()
-
     report(deadSymbols, callGraph: callGraph)
   }
 
@@ -291,7 +303,7 @@ struct DeadCodeFinder: ParsableCommand {
       return indexKind == .function || indexKind == .instanceMethod || indexKind == .staticMethod
     case .initializer:
       return indexKind == .constructor
-    case .variable:
+    case .variable, .property:
       return indexKind == .variable || indexKind == .instanceProperty
         || indexKind == .staticProperty
     case .struct:

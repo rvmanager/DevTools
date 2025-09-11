@@ -25,7 +25,9 @@ class SyntaxAnalyzer: @unchecked Sendable {
     log("Starting concurrent analysis of \(files.count) files...")
     DispatchQueue.concurrentPerform(iterations: files.count) { index in
       let fileURL = files[index]
-      log("Parsing \(fileURL.path)...")
+      if verbose {
+        log("Parsing \(fileURL.path)...")
+      }
       do {
         let source = try String(contentsOf: fileURL, encoding: .utf8)
         let sourceTree = Parser.parse(source: source)
@@ -39,8 +41,9 @@ class SyntaxAnalyzer: @unchecked Sendable {
         if !fileEntryPoints.isEmpty {
           entryPoints.append(contentsOf: fileEntryPoints)
         }
-        log("Finished parsing \(fileURL.path). Found \(visitor.definitions.count) definitions.")
-
+        if verbose {
+          log("Finished parsing \(fileURL.path). Found \(visitor.definitions.count) definitions.")
+        }
       } catch {
         print("[ERROR] Error parsing file \(fileURL.path): \(error)")
       }
@@ -229,43 +232,90 @@ private class FunctionVisitor: SyntaxVisitor {
       }
       let varName = pattern.identifier.text
 
-      // We only care about member variables that are computed properties (have a body)
-      guard node.parent?.is(MemberBlockSyntax.self) == true, binding.accessorBlock != nil else {
-        continue
-      }
+      // It's a computed property if it has an accessor block
+      if binding.accessorBlock != nil {
+        guard node.parent?.is(MemberBlockSyntax.self) == true else { continue }
 
-      let fullName = createUniqueName(baseName: varName, node: node)
-      let location = sourceLocation(for: node)
+        let fullName = createUniqueName(baseName: varName, node: node)
+        let location = sourceLocation(for: node)
 
-      var isEntryPoint = false
-      if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
-        if parentStruct.inheritanceClause?.inheritedTypes.contains(where: {
-          let typeDescription = $0.type.description
-          let isEntryPointType = typeDescription.contains("View") || typeDescription.contains("App")
-          if isEntryPointType && verbose {
-            log("Marking '\(fullName)' as entry point because it is a 'body' in a View/App")
+        var isEntryPoint = false
+        if varName == "body", let parentStruct = findEnclosingStruct(for: node) {
+          if parentStruct.inheritanceClause?.inheritedTypes.contains(where: {
+            let typeDescription = $0.type.description
+            let isEntryPointType =
+              typeDescription.contains("View") || typeDescription.contains("App")
+            if isEntryPointType && verbose {
+              log("Marking '\(fullName)' as entry point because it is a 'body' in a View/App")
+            }
+            return isEntryPointType
+          }) == true {
+            isEntryPoint = true
           }
-          return isEntryPointType
-        }) == true {
-          isEntryPoint = true
         }
-      }
 
-      let definition = SourceDefinition(
-        name: fullName, kind: .variable, location: location, isEntryPoint: isEntryPoint
-      )
-      definitions.append(definition)
-      enterScope(name: varName, node: node)
+        let definition = SourceDefinition(
+          name: fullName, kind: .variable, location: location, isEntryPoint: isEntryPoint
+        )
+        definitions.append(definition)
+        enterScope(name: varName, node: node)
+
+      } else {
+        // --- Logic for Stored Properties ---
+        var accessLevel: AccessLevel = .internal
+        for modifier in node.modifiers {
+          switch modifier.name.text {
+          case "private":
+            accessLevel = .private
+            break
+          case "fileprivate":
+            accessLevel = .fileprivate
+            break
+          case "public":
+            accessLevel = .public
+            break
+          case "open":
+            accessLevel = .open
+            break
+          default: break
+          }
+        }
+
+        let fullName = createUniqueName(baseName: varName, node: node)
+        let location = sourceLocation(for: node)
+
+        var propertyTypeName: String?
+        if let typeAnnotation = binding.typeAnnotation {
+          propertyTypeName = typeAnnotation.type.trimmedDescription
+        } else if let initializer = binding.initializer,
+          let funcCall = initializer.value.as(FunctionCallExprSyntax.self),
+          let identifier = funcCall.calledExpression.as(DeclReferenceExprSyntax.self)
+        {
+          propertyTypeName = identifier.baseName.text
+        }
+
+        guard let finalTypeName = propertyTypeName else { continue }
+
+        var definition = SourceDefinition(
+          name: fullName,
+          kind: .property,
+          location: location,
+          isEntryPoint: false
+        )
+        definition.typeName = finalTypeName
+        definition.accessLevel = accessLevel
+        definitions.append(definition)
+      }
     }
     return .visitChildren
   }
 
   override func visitPost(_ node: VariableDeclSyntax) {
+    // Only exit scope for computed properties, where we entered one.
     for binding in node.bindings {
-      guard node.parent?.is(MemberBlockSyntax.self) == true, binding.accessorBlock != nil else {
-        continue
+      if binding.accessorBlock != nil {
+        exitScope()
       }
-      exitScope()
     }
   }
 
@@ -403,22 +453,6 @@ private class FunctionVisitor: SyntaxVisitor {
     if verbose {
       print("[VISITOR] \(message)")
     }
-  }
-
-  private func getCurrentTypeContext() -> String {
-    // Walk up the context stack to find the nearest type (struct/class/enum)
-    for context in contextStack.reversed() {
-      // Extract the type name from contexts like "RefreshSchedulingService.calculateNextRefreshDate"
-      let components = context.components(separatedBy: ".")
-      if components.count >= 1 {
-        let firstComponent = components[0]
-        // Check if this looks like a type name (starts with uppercase)
-        if let firstChar = firstComponent.first, firstChar.isUppercase {
-          return firstComponent
-        }
-      }
-    }
-    return ""
   }
 
   private func createUniqueName(baseName: String, node: SyntaxProtocol) -> String {
@@ -564,60 +598,5 @@ private class FunctionVisitor: SyntaxVisitor {
       endLine: end.line,
       endColumn: end.column
     )
-  }
-
-  // Debug helper to try multiple line positions for USR lookup
-  private func findUSRForDefinition(
-    name: String, primaryLocation: SourceLocation, usrLookup: [String: [Int: String]]
-  ) -> String? {
-    let filePath = primaryLocation.filePath
-
-    // Try exact match first
-    if let usr = usrLookup[filePath]?[primaryLocation.line] {
-      if verbose {
-        log("Found exact USR match for \(name) at line \(primaryLocation.line)")
-      }
-      return usr
-    }
-
-    // Try nearby lines (±3 lines)
-    for offset in 1...3 {
-      // Try lines after
-      if let usr = usrLookup[filePath]?[primaryLocation.line + offset] {
-        if verbose {
-          log(
-            "Found USR for \(name) at line \(primaryLocation.line + offset) (offset +\(offset) from SwiftSyntax line \(primaryLocation.line))"
-          )
-        }
-        return usr
-      }
-
-      // Try lines before
-      let beforeLine = primaryLocation.line - offset
-      if beforeLine > 0, let usr = usrLookup[filePath]?[beforeLine] {
-        if verbose {
-          log(
-            "Found USR for \(name) at line \(beforeLine) (offset -\(offset) from SwiftSyntax line \(primaryLocation.line))"
-          )
-        }
-        return usr
-      }
-    }
-
-    // For structs/classes, also try looking for any USR in a wider range (the body)
-    if primaryLocation.endLine > primaryLocation.line {
-      for line in primaryLocation.line...min(primaryLocation.line + 10, primaryLocation.endLine) {
-        if let usr = usrLookup[filePath]?[line] {
-          if verbose {
-            log(
-              "Found USR for \(name) in body range at line \(line) (SwiftSyntax range: \(primaryLocation.line)-\(primaryLocation.endLine))"
-            )
-          }
-          return usr
-        }
-      }
-    }
-
-    return nil
   }
 }
