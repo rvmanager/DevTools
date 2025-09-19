@@ -10,7 +10,32 @@ struct AnalysisResult {
   let entryPoints: [SourceDefinition]
 }
 
-class SyntaxAnalyzer: @unchecked Sendable {
+// Actor to safely collect analysis results from concurrent operations
+actor AnalysisResultCollector {
+  private var definitions: [SourceDefinition] = []
+  private var calls: [FunctionCall] = []
+  private var entryPoints: [SourceDefinition] = []
+
+  func addResults(_ fileDefinitions: [SourceDefinition], _ fileCalls: [FunctionCall]) {
+    definitions.append(contentsOf: fileDefinitions)
+    calls.append(contentsOf: fileCalls)
+
+    let fileEntryPoints = fileDefinitions.filter { $0.isEntryPoint }
+    if !fileEntryPoints.isEmpty {
+      entryPoints.append(contentsOf: fileEntryPoints)
+    }
+  }
+
+  func getResults() -> AnalysisResult {
+    return AnalysisResult(
+      definitions: definitions,
+      calls: calls,
+      entryPoints: entryPoints
+    )
+  }
+}
+
+final class SyntaxAnalyzer: Sendable {
   let verbose: Bool
 
   init(verbose: Bool) {
@@ -18,43 +43,57 @@ class SyntaxAnalyzer: @unchecked Sendable {
   }
 
   func analyze(files: [URL]) -> AnalysisResult {
-    let definitions = ThreadSafeArray<SourceDefinition>()
-    let calls = ThreadSafeArray<FunctionCall>()
-    let entryPoints = ThreadSafeArray<SourceDefinition>()
+    // Run the async work synchronously using runBlocking equivalent
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: AnalysisResult!
+
+    Task {
+      result = await self.analyzeAsync(files: files)
+      semaphore.signal()
+    }
+
+    semaphore.wait()
+    return result
+  }
+
+  private func analyzeAsync(files: [URL]) async -> AnalysisResult {
+    let collector = AnalysisResultCollector()
 
     log("Starting concurrent analysis of \(files.count) files...")
-    DispatchQueue.concurrentPerform(iterations: files.count) { index in
-      let fileURL = files[index]
-      if verbose {
-        log("Parsing \(fileURL.path)...")
-      }
-      do {
-        let source = try String(contentsOf: fileURL, encoding: .utf8)
-        let sourceTree = Parser.parse(source: source)
 
-        let visitor = FunctionVisitor(fileURL: fileURL, verbose: verbose)
-        visitor.walk(sourceTree)
-
-        definitions.append(contentsOf: visitor.definitions)
-        calls.append(contentsOf: visitor.calls)
-        let fileEntryPoints = visitor.definitions.filter { $0.isEntryPoint }
-        if !fileEntryPoints.isEmpty {
-          entryPoints.append(contentsOf: fileEntryPoints)
+    // Use TaskGroup for structured concurrency
+    await withTaskGroup(of: Void.self) { group in
+      for fileURL in files {
+        group.addTask { [self] in
+          await self.analyzeFile(fileURL, collector: collector)
         }
-        if verbose {
-          log("Finished parsing \(fileURL.path). Found \(visitor.definitions.count) definitions.")
-        }
-      } catch {
-        print("[ERROR] Error parsing file \(fileURL.path): \(error)")
       }
     }
 
     log("Finished all concurrent analysis.")
-    return AnalysisResult(
-      definitions: definitions.items,
-      calls: calls.items,
-      entryPoints: entryPoints.items
-    )
+    return await collector.getResults()
+  }
+
+  private func analyzeFile(_ fileURL: URL, collector: AnalysisResultCollector) async {
+    if verbose {
+      log("Parsing \(fileURL.path)...")
+    }
+
+    do {
+      let source = try String(contentsOf: fileURL, encoding: .utf8)
+      let sourceTree = Parser.parse(source: source)
+
+      let visitor = FunctionVisitor(fileURL: fileURL, verbose: verbose)
+      visitor.walk(sourceTree)
+
+      await collector.addResults(visitor.definitions, visitor.calls)
+
+      if verbose {
+        log("Finished parsing \(fileURL.path). Found \(visitor.definitions.count) definitions.")
+      }
+    } catch {
+      print("[ERROR] Error parsing file \(fileURL.path): \(error)")
+    }
   }
 
   private func log(_ message: String) {
@@ -64,28 +103,7 @@ class SyntaxAnalyzer: @unchecked Sendable {
   }
 }
 
-// Thread-safe array wrapper to fix concurrency warnings
-private class ThreadSafeArray<T: Sendable>: @unchecked Sendable {
-  private var _items: [T] = []
-  private let queue = DispatchQueue(
-    label: "com.deadcodefinder.threadsafe-array", attributes: .concurrent)
-
-  var items: [T] {
-    var itemsCopy: [T]!
-    queue.sync {
-      itemsCopy = self._items
-    }
-    return itemsCopy
-  }
-
-  func append(contentsOf newItems: [T]) {
-    guard !newItems.isEmpty else { return }
-    queue.async(flags: .barrier) {
-      self._items.append(contentsOf: newItems)
-    }
-  }
-}
-
+// FunctionVisitor remains a class but is now only used within a single task
 private class FunctionVisitor: SyntaxVisitor {
   let fileURL: URL
   let verbose: Bool
